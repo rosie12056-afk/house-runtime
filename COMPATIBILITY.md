@@ -2,12 +2,12 @@
 
 ## Current release
 
-The released alpha line remains pinned to stable v0.2. Runtime `v0.2.0-rc.1` explicitly adopts lifecycle contract candidates and committed lockfile SHAs:
+The released alpha line remains pinned to stable v0.2. Runtime `v0.2.0` explicitly adopts stable lifecycle contracts and committed lockfile SHAs:
 
 | Dependency | Locked release | Role | Loaded at runtime |
 | --- | --- | --- | --- |
-| House Protocols | `v0.2.1-rc.1` | Stable v0.2 plus additive lifecycle contracts | Yes |
-| House Toolkit | `v0.2.1-rc.1` | Migration, privacy, lifecycle, and conformance checks | No; development dependency only |
+| House Protocols | `v0.2.1` | Stable v0.2 plus additive lifecycle contracts | Yes |
+| House Toolkit | `v0.2.1` | Migration, privacy, lifecycle, and conformance checks | No; development dependency only |
 
 The Runtime requires Node.js 22.13 or newer and is tested on Node 22 and 24.
 
@@ -25,7 +25,7 @@ The Runtime requires Node.js 22.13 or newer and is tested on Node 22 and 24.
 | --- | --- | --- | --- |
 | `v0.1.0-alpha.1` | `0.1` | Toolkit `v0.1.1` | Tested and released |
 | `v0.1.0-alpha.2.1` | writes `0.2` and retains stored `0.1` reads | Toolkit `v0.2.0` | Tested; shared migrations, restart confirmation, lease expiry, cancellation, timeout, and retry boundaries pass |
-| `v0.2.0-rc.1` | `0.2` plus additive lifecycle records | Toolkit `v0.2.1-rc.1` | Lifecycle candidate; fake-clock sleep, restart, tick, journal, dream, handoff, delivery, and feedback tests pass |
+| `v0.2.0` | `0.2` plus additive lifecycle records | Toolkit `v0.2.1` | Released; fake-clock sleep, restart, tick, journal, dream, handoff, delivery, and feedback tests pass |
 | planned v0.2 | v0.2 plus lifecycle contracts | Toolkit v0.2 or later compatible profile | Not yet implemented |
 
 Compatibility is established by fixtures and restart tests, not by similar version labels.
