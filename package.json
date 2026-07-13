@@ -1,0 +1,42 @@
+{
+  "name": "house-runtime",
+  "version": "0.1.0-alpha.1",
+  "description": "A model-independent runtime for persistent single-user agent systems.",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "private": false,
+  "files": [
+    "demo",
+    "scripts/public-text-allowlist.txt",
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "scripts": {
+    "demo": "node demo/run.mjs",
+    "test": "node --test",
+    "scan:private": "house-privacy-scan . --exclude node_modules --exclude .git --exclude .demo-output --english-only --allow-text-file scripts/public-text-allowlist.txt",
+    "check": "npm test && npm run demo && npm run scan:private"
+  },
+  "dependencies": {
+    "house-protocols": "github:rosie12056-afk/house-protocols#v0.1.1"
+  },
+  "devDependencies": {
+    "house-toolkit": "github:rosie12056-afk/house-toolkit#v0.1.1"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rosie12056-afk/house-runtime.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rosie12056-afk/house-runtime/issues"
+  },
+  "homepage": "https://github.com/rosie12056-afk/house-runtime#readme"
+}
