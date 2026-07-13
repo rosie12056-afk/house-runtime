@@ -1,6 +1,6 @@
 {
   "name": "house-runtime",
-  "version": "0.2.0",
+  "version": "0.3.0-rc.0",
   "description": "A model-independent runtime for persistent single-user agent systems.",
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -31,7 +31,7 @@
     "house-protocols": "github:rosie12056-afk/house-protocols#v0.2.1"
   },
   "devDependencies": {
-    "house-toolkit": "github:rosie12056-afk/house-toolkit#v0.2.1"
+    "house-toolkit": "github:rosie12056-afk/house-toolkit#t4-portability"
   },
   "engines": {
     "node": ">=22.13"
