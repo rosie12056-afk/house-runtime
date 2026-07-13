@@ -2,6 +2,8 @@
 
 House Runtime executes the contracts defined by House Protocols and uses House Toolkit during development and release checks. Milestones are gated by durable behavior, not feature count.
 
+For the five-repository dependency timeline, see the canonical [House Ecosystem Roadmap](https://github.com/rosie12056-afk/house-protocols/blob/main/ECOSYSTEM-ROADMAP.md).
+
 | Milestone | Target gate | What it adds | Problem solved | Primary users |
 | --- | --- | --- | --- | --- |
 | `v0.1.0-alpha.1` | Released | Durable Runs, per-room queues, proposal recovery, Context Manifests, artifacts, runtime-derived Evidence and Initiative completion, immutable Keel revisions, policy-gated memory, and durable Outbox | Proves that a model-independent agent workflow can survive restart without letting model claims replace execution results | Runtime evaluators and early implementers |
