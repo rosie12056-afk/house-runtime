@@ -1,6 +1,6 @@
 {
   "name": "house-runtime",
-  "version": "0.1.0-alpha.2-dev.1",
+  "version": "0.1.0-alpha.2",
   "description": "A model-independent runtime for persistent single-user agent systems.",
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -12,6 +12,7 @@
     "README.md",
     "ROADMAP.md",
     "COMPATIBILITY.md",
+    "MIGRATION.md",
     "LICENSE",
     "NOTICE"
   ],

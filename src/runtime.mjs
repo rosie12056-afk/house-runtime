@@ -1,5 +1,7 @@
 import { assertProtocol, protocolProfiles } from "house-protocols";
-import { createId, isoTime, runScopedId } from "./ids.mjs";
+import { ExecutionCancelledError, ExecutionTimeoutError, runWithControls } from "./execution-control.mjs";
+import { createId, isoTime, runScopedId, sha256 } from "./ids.mjs";
+import { assertMemoryPort, SQLiteMemoryPort } from "./memory-port.mjs";
 import { RoomQueue } from "./room-queue.mjs";
 import { RuntimeStore } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
@@ -60,17 +62,30 @@ function publicRun(run) {
 export class HouseRuntime {
   #agents = new Map();
   #scheduled = new Map();
+  #controllers = new Map();
+  #leases = new Map();
 
-  constructor({ dbPath, workspaceDir, instanceId = "instance:fictional-demo", userId = "user:avery", protocolVersion = "0.2", clock = () => new Date(), memoryPolicy = null }) {
+  constructor({ dbPath, workspaceDir, instanceId = "instance:fictional-demo", userId = "user:avery", runtimeId = createId("runtime"), protocolVersion = "0.2", clock = () => new Date(), timer, leaseMs = 30000, defaultTimeoutMs = 120000, defaultMaxAttempts = 3, confirmationVerifier = null, memoryPolicy = null, memoryPort = null }) {
     assertString(instanceId, "instanceId", 160);
     assertString(userId, "userId", 160);
+    assertString(runtimeId, "runtimeId", 160);
     if (!protocolProfiles().includes(protocolVersion)) throw new Error(`unsupported protocolVersion: ${protocolVersion}`);
+    if (!Number.isInteger(leaseMs) || leaseMs < 1000) throw new Error("leaseMs must be an integer of at least 1000");
+    if (!Number.isInteger(defaultTimeoutMs) || defaultTimeoutMs < 1) throw new Error("defaultTimeoutMs must be a positive integer");
+    if (!Number.isInteger(defaultMaxAttempts) || defaultMaxAttempts < 1 || defaultMaxAttempts > 20) throw new Error("defaultMaxAttempts must be between 1 and 20");
     this.instanceId = instanceId;
     this.userId = userId;
+    this.runtimeId = runtimeId;
     this.protocolVersion = protocolVersion;
     this.clock = clock;
+    this.timer = timer;
+    this.leaseMs = leaseMs;
+    this.defaultTimeoutMs = defaultTimeoutMs;
+    this.defaultMaxAttempts = defaultMaxAttempts;
+    this.confirmationVerifier = confirmationVerifier;
     this.memoryPolicy = memoryPolicy;
     this.store = new RuntimeStore(dbPath);
+    this.memoryPort = assertMemoryPort(memoryPort || new SQLiteMemoryPort(this.store));
     this.workspace = new Workspace(workspaceDir);
     this.roomQueue = new RoomQueue();
   }
@@ -92,18 +107,27 @@ export class HouseRuntime {
     return this.store.getCurrentKeel(subjectId);
   }
 
-  queueRequest({ roomId, agentId, message, idempotencyKey, contextRefs = [] }) {
+  queueRequest({ roomId, agentId, message, idempotencyKey, contextRefs = [], timeoutMs = this.defaultTimeoutMs, maxAttempts = this.defaultMaxAttempts, capabilityGrant = null }) {
     assertString(roomId, "roomId", 160);
     assertString(agentId, "agentId", 160);
     assertString(message, "message", 32000);
     assertString(idempotencyKey, "idempotencyKey", 200);
     if (idempotencyKey.length < 8) throw new Error("idempotencyKey must be at least 8 characters");
     if (!Array.isArray(contextRefs) || contextRefs.length > 32) throw new Error("contextRefs must contain at most 32 references");
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new Error("timeoutMs must be a positive integer");
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 20) throw new Error("maxAttempts must be between 1 and 20");
 
     const existingEvent = this.store.findEventByIdempotency(idempotencyKey);
     if (existingEvent) return publicRun(this.store.getRunByRequestEvent(existingEvent.event_id));
 
     const at = isoTime(this.clock);
+    if (capabilityGrant) {
+      assertProtocol("capability_grant", capabilityGrant, { profile: "0.2" });
+      if (capabilityGrant.grantee_id !== agentId) throw new Error("capability grant grantee does not match the requested agent");
+      if (capabilityGrant.revoked_at) throw new Error("capability grant is revoked");
+      if (capabilityGrant.not_before && Date.parse(at) < Date.parse(capabilityGrant.not_before)) throw new Error("capability grant is not active yet");
+      if (capabilityGrant.expires_at && Date.parse(at) >= Date.parse(capabilityGrant.expires_at)) throw new Error("capability grant is expired");
+    }
     const event = {
       protocol_version: this.protocolVersion,
       event_id: createId("event"),
@@ -125,12 +149,23 @@ export class HouseRuntime {
       agent_id: agentId,
       request_event_id: event.event_id,
       status: "queued",
+      timeout_ms: timeoutMs,
+      max_attempts: maxAttempts,
       created_at: at,
       updated_at: at,
     };
+    const needsConfirmation = capabilityGrant?.confirmation_mode === "each_use";
+    const confirmation = needsConfirmation
+      ? {
+          confirmation_id: runScopedId("confirmation", run.run_id),
+          action_digest: sha256(JSON.stringify({ event_id: event.event_id, grant_id: capabilityGrant.grant_id, capability: capabilityGrant.capability, scope: capabilityGrant.scope })),
+        }
+      : null;
     this.store.transaction(() => {
       this.store.insertEvent(event, roomId);
       this.store.createRun(run);
+      if (confirmation) this.store.createConfirmation(run.run_id, confirmation, capabilityGrant, at);
+      this.#audit(run.run_id, confirmation ? "confirmation_requested" : "run_queued", { confirmation_id: confirmation?.confirmation_id || null }, at);
     });
     return publicRun(this.store.getRun(run.run_id));
   }
@@ -138,6 +173,7 @@ export class HouseRuntime {
   async submit(request) {
     if (!this.#agents.has(request.agentId)) throw new Error(`no adapter registered for ${request.agentId}`);
     const run = this.queueRequest(request);
+    if (run.status === "waiting_confirmation") return run;
     return this.executeRun(run.run_id);
   }
 
@@ -145,10 +181,44 @@ export class HouseRuntime {
     const run = this.store.getRun(runId);
     if (!run) return Promise.reject(new Error(`unknown run: ${runId}`));
     if (run.status === "completed") return Promise.resolve(publicRun(run));
-    if (run.status === "failed" && !this.store.requeueRun(runId, isoTime(this.clock))) {
+    if (run.status === "cancelled") return Promise.reject(new Error(`cancelled run requires a new request: ${runId}`));
+    const at = isoTime(this.clock);
+    if (["failed", "timed_out"].includes(run.status) && !this.store.requeueRun(runId, at)) {
       return Promise.reject(new Error(`failed to requeue run: ${runId}`));
     }
+    this.#audit(runId, "run_retried", { next_attempt: run.attempts + 1, max_attempts: run.max_attempts }, at);
     return this.executeRun(runId);
+  }
+
+  async resolveConfirmation({ confirmationId, decision, authentication }) {
+    assertString(confirmationId, "confirmationId", 160);
+    if (!new Set(["approve", "deny"]).has(decision)) throw new Error("decision must be approve or deny");
+    if (typeof this.confirmationVerifier !== "function") throw new Error("confirmationVerifier is required to resolve confirmation challenges");
+    const pending = this.store.getConfirmation(confirmationId);
+    if (!pending || pending.status !== "pending") throw new Error(`unknown or resolved confirmation: ${confirmationId}`);
+    const verified = await this.confirmationVerifier({ authentication, confirmation: structuredClone(pending), decision });
+    assertString(verified?.subject_id, "verified subject_id", 160);
+    const at = isoTime(this.clock);
+    const resolved = this.store.resolveConfirmation(confirmationId, decision === "approve" ? "approved" : "denied", verified.subject_id, at);
+    if (!resolved) throw new Error(`unknown or resolved confirmation: ${confirmationId}`);
+    this.#audit(resolved.run_id, "confirmation_resolved", { confirmation_id: confirmationId, decision, authenticated_by: verified.subject_id }, at);
+    if (decision === "deny") return publicRun(this.store.getRun(resolved.run_id));
+    return this.executeRun(resolved.run_id);
+  }
+
+  cancelRun(runId, { authenticatedBy = this.userId, reason = "cancelled_by_user" } = {}) {
+    assertString(authenticatedBy, "authenticatedBy", 160);
+    assertString(reason, "reason", 240);
+    const run = this.store.getRun(runId);
+    if (!run) throw new Error(`unknown run: ${runId}`);
+    if (["completed", "cancelled", "timed_out"].includes(run.status)) return publicRun(run);
+    const at = isoTime(this.clock);
+    this.store.setTerminalStatus(runId, "cancelled", { name: "ExecutionCancelledError", message: reason }, at);
+    this.#controllers.get(runId)?.abort();
+    const lease = this.#leases.get(runId);
+    if (lease) this.store.releaseLease(lease.lease_id, at);
+    this.#audit(runId, "run_cancelled", { authenticated_by: authenticatedBy, reason }, at);
+    return publicRun(this.store.getRun(runId));
   }
 
   executeRun(runId) {
@@ -156,7 +226,7 @@ export class HouseRuntime {
     if (existing) return existing;
     const run = this.store.getRun(runId);
     if (!run) return Promise.reject(new Error(`unknown run: ${runId}`));
-    if (run.status === "completed" || run.status === "failed") return Promise.resolve(publicRun(run));
+    if (["completed", "failed", "cancelled", "timed_out", "waiting_confirmation"].includes(run.status)) return Promise.resolve(publicRun(run));
     const scheduled = this.roomQueue.run(run.room_id, () => this.#executeNow(runId)).finally(() => this.#scheduled.delete(runId));
     this.#scheduled.set(runId, scheduled);
     return scheduled;
@@ -168,34 +238,82 @@ export class HouseRuntime {
 
   async #executeNow(runId) {
     let run = this.store.getRun(runId);
-    if (run.status === "completed" || run.status === "failed") return publicRun(run);
+    if (["completed", "failed", "cancelled", "timed_out", "waiting_confirmation"].includes(run.status)) return publicRun(run);
     const adapter = this.#agents.get(run.agent_id);
     if (!adapter) throw new Error(`no adapter registered for ${run.agent_id}`);
     const startedAt = isoTime(this.clock);
-    this.store.markRunRunning(runId, startedAt);
+    const leaseDuration = Math.max(this.leaseMs, run.timeout_ms + 1000);
+    const lease = this.store.acquireLease({
+      protocol_version: "0.2",
+      lease_id: runScopedId("lease", run.run_id, createId("attempt").slice("attempt:".length)),
+      run_id: run.run_id,
+      work_ref: { ref_id: run.run_id, kind: "other", locator: `runs/${run.run_id}` },
+      holder_id: this.runtimeId,
+      status: "active",
+      acquired_at: startedAt,
+      expires_at: new Date(Date.parse(startedAt) + leaseDuration).toISOString(),
+    });
+    if (!lease) {
+      this.#audit(runId, "lease_conflict", {}, startedAt);
+      return publicRun(this.store.getRun(runId));
+    }
+    assertProtocol("scheduler_lease", lease, { profile: "0.2" });
+    this.#leases.set(runId, lease);
+    this.#audit(runId, "lease_acquired", { lease_id: lease.lease_id, fencing_token: lease.fencing_token }, startedAt);
+    if (!this.store.markRunRunning(runId, startedAt)) {
+      this.store.releaseLease(lease.lease_id, startedAt);
+      this.#leases.delete(runId);
+      this.store.failRun(runId, { name: "RetryBudgetExceeded", message: "Run has no remaining attempts." }, startedAt);
+      this.#audit(runId, "retry_budget_exhausted", { max_attempts: run.max_attempts }, startedAt);
+      return publicRun(this.store.getRun(runId));
+    }
+    const controller = new AbortController();
+    this.#controllers.set(runId, controller);
 
     try {
       const event = this.store.getEvent(run.request_event_id);
       const context = this.#buildContext(run, event, startedAt);
       let proposal = this.store.getProposal(runId);
       if (!proposal) {
-        proposal = validateProposal(await adapter.generate({
+        proposal = validateProposal(await runWithControls(() => adapter.generate({
           run: publicRun(this.store.getRun(runId)),
           event: structuredClone(event),
           context: structuredClone(context.adapterContext),
-        }));
+          signal: controller.signal,
+        }), { signal: controller.signal, timeoutMs: run.timeout_ms, timer: this.timer }));
         this.store.saveProposal(runId, proposal, isoTime(this.clock));
       } else {
         validateProposal(proposal);
       }
+      if (controller.signal.aborted) throw new ExecutionCancelledError();
 
       const result = await this.#materialize(run, event, proposal);
       run = this.store.getRun(runId);
       return publicRun(run || { ...run, result });
     } catch (error) {
       const at = isoTime(this.clock);
-      this.store.failRun(runId, { name: error.name, message: this.#sanitizeErrorMessage(error.message) }, at);
+      const sanitized = { name: error.name, message: this.#sanitizeErrorMessage(error.message) };
+      if (error instanceof ExecutionCancelledError) {
+        if (this.store.getRun(runId).status !== "cancelled") {
+          this.store.setTerminalStatus(runId, "cancelled", sanitized, at);
+          this.#audit(runId, "run_cancelled", {}, at);
+        }
+      } else if (error instanceof ExecutionTimeoutError) {
+        this.store.setTerminalStatus(runId, "timed_out", sanitized, at);
+        this.#audit(runId, "run_timed_out", { timeout_ms: run.timeout_ms }, at);
+      } else {
+        this.store.failRun(runId, sanitized, at);
+        this.#audit(runId, "run_failed", { error_name: error.name }, at);
+      }
       return publicRun(this.store.getRun(runId));
+    } finally {
+      this.#controllers.delete(runId);
+      const released = this.store.releaseLease(lease.lease_id, isoTime(this.clock));
+      if (released) {
+        assertProtocol("scheduler_lease", released, { profile: "0.2" });
+        this.#audit(runId, "lease_released", { lease_id: lease.lease_id, fencing_token: lease.fencing_token }, released.released_at);
+      }
+      this.#leases.delete(runId);
     }
   }
 
@@ -205,9 +323,20 @@ export class HouseRuntime {
       .replaceAll(this.store.path, "<database>");
   }
 
+  #audit(runId, eventType, detail = {}, at = isoTime(this.clock)) {
+    this.store.saveAudit({
+      audit_id: createId("audit"),
+      run_id: runId,
+      event_type: eventType,
+      actor_id: this.runtimeId,
+      detail,
+      occurred_at: at,
+    });
+  }
+
   #buildContext(run, event, at) {
     const keel = this.store.getCurrentKeel(run.agent_id);
-    const memories = this.store.listMemories(run.agent_id, 20);
+    const memories = this.memoryPort.list(run.agent_id, 20);
     const requestedRefs = (event.payload.context_refs || []).map(normalizeReference);
     const entries = [
       {
@@ -273,6 +402,7 @@ export class HouseRuntime {
     let artifacts = [];
     let memory = null;
     let memoryDecision = null;
+    let resignature = null;
 
     if (proposal.work) {
       const active = {
@@ -366,6 +496,28 @@ export class HouseRuntime {
         }
         if (memoryDecision.decision === "quarantine") memory.status = "quarantined";
         else if (memoryDecision.decision !== "allow") memory = null;
+        if (memory?.status === "active" && this.protocolVersion === "0.2") {
+          const previous = this.memoryPort.latestResignature(run.agent_id);
+          resignature = {
+            protocol_version: "0.2",
+            resignature_id: runScopedId("resignature", run.run_id, "reflection"),
+            subject_id: run.agent_id,
+            source_ref: { ref_id: requestEvent.event_id, kind: "event", locator: `events/${requestEvent.event_id}`, observed_at: requestEvent.occurred_at },
+            ...(previous ? { previous_resignature_id: previous.resignature_id } : {}),
+            layer: (previous?.layer || 0) + 1,
+            stance: "recognize",
+            claim_scope: "interpretation_only",
+            reflection_body: proposal.work.reflection,
+            evidence_refs: [evidence.bundle_id],
+            created_at: finishedAt,
+            provenance: {
+              origin: "self_reflection",
+              recorded_by: run.agent_id,
+              trigger_ref: { ref_id: requestEvent.event_id, kind: "event", locator: `events/${requestEvent.event_id}`, observed_at: requestEvent.occurred_at },
+            },
+          };
+          assertProtocol("resignature", resignature, { profile: "0.2" });
+        }
       }
     }
 
@@ -391,6 +543,7 @@ export class HouseRuntime {
       evidence_bundle_id: evidence?.bundle_id || null,
       artifact_ids: artifacts.map((artifact) => artifact.artifact_id),
       memory_id: memory?.memory_id || null,
+      resignature_id: resignature?.resignature_id || null,
       outbox_id: outboxId,
     };
 
@@ -399,7 +552,8 @@ export class HouseRuntime {
       if (evidence) this.store.saveEvidence(run.run_id, evidence);
       if (initiative) this.store.saveInitiative(run.run_id, initiative);
       if (memoryDecision) this.store.saveMemoryPolicy(run.run_id, memoryDecision);
-      if (memory) this.store.saveMemory(run.run_id, memory);
+      if (memory) this.memoryPort.save(run.run_id, memory);
+      if (resignature) this.memoryPort.saveResignature(run.run_id, resignature);
       this.store.insertEvent(responseEvent, run.room_id);
       this.store.enqueueOutbox(run.run_id, outboxId, responseEvent.event_id, responseAt);
       this.store.completeRun(run.run_id, result, responseAt);
@@ -455,10 +609,19 @@ export class HouseRuntime {
   }
 
   listMemories(subjectId, limit = 20, options = {}) {
-    return this.store.listMemories(subjectId, limit, options);
+    return this.memoryPort.list(subjectId, limit, options);
+  }
+
+  listResignatures(subjectId, limit = 20) {
+    return this.memoryPort.listResignatures(subjectId, limit);
+  }
+
+  getAudit(runId) {
+    return this.store.listAudit(runId);
   }
 
   close() {
+    if (this.#scheduled.size) throw new Error("cannot close Runtime while Runs are active");
     this.store.close();
   }
 }

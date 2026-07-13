@@ -4,11 +4,56 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { HouseRuntime } from "../src/index.mjs";
+import { DatabaseSync } from "node:sqlite";
+import { HouseRuntime, RuntimeStore, SQLiteMemoryPort } from "../src/index.mjs";
 import { runMigrationConformance } from "house-toolkit/src/conformance.mjs";
 import { fictionalMemoryPolicy, lanternAdapter, lanternKeel } from "../demo/fixtures.mjs";
 
 const protocolsRoot = resolve(dirname(fileURLToPath(import.meta.resolve("house-protocols"))), "..");
+
+class ManualTime {
+  constructor(value = "2032-04-05T09:00:00.000Z") {
+    this.now = Date.parse(value);
+    this.nextId = 1;
+    this.jobs = new Map();
+  }
+
+  clock = () => new Date(this.now);
+
+  setTimeout(callback, milliseconds) {
+    const id = this.nextId++;
+    this.jobs.set(id, { at: this.now + milliseconds, callback });
+    return id;
+  }
+
+  clearTimeout(id) {
+    this.jobs.delete(id);
+  }
+
+  advance(milliseconds) {
+    this.now += milliseconds;
+    const due = [...this.jobs.entries()].filter(([, job]) => job.at <= this.now).sort((a, b) => a[1].at - b[1].at);
+    for (const [id, job] of due) {
+      this.jobs.delete(id);
+      job.callback();
+    }
+  }
+}
+
+function highRiskGrant() {
+  return {
+    protocol_version: "0.2",
+    grant_id: "grant:fictional:external-write",
+    grantee_id: "agent:lantern",
+    capability: "external.write",
+    scope: { resource_pattern: "fictional://outbox/**", operations: ["create"] },
+    risk_tier: "high",
+    confirmation_mode: "each_use",
+    issued_by: "user:avery",
+    issued_at: "2032-04-05T08:00:00.000Z",
+    expires_at: "2032-04-06T08:00:00.000Z",
+  };
+}
 
 function environment(name, overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), `house-runtime-${name}-`));
@@ -60,8 +105,196 @@ test("a durable work run links actual artifacts, evidence, initiative, memory, a
   assert.equal(runtime.store.listOutbox("pending").length, 1);
   assert.equal(JSON.stringify(runtime.getManifest(run.run_id)).includes(message), false);
   assert.equal(runtime.getManifest(run.run_id).entries.some((entry) => entry.locator.includes("keels/")), true);
+  assert.equal(run.result.resignature_id != null, true);
+  assert.equal(runtime.listResignatures("agent:lantern")[0].claim_scope, "interpretation_only");
+  assert.equal(runtime.getAudit(run.run_id).some((event) => event.event_type === "lease_acquired"), true);
   assert.equal(statSync(options.dbPath).mode & 0o777, 0o600);
   runtime.close();
+});
+
+test("high-risk work waits for host-authenticated confirmation and survives a rejected credential", async () => {
+  const time = new ManualTime();
+  let calls = 0;
+  const { options } = environment("confirmation", {
+    clock: time.clock,
+    confirmationVerifier({ authentication }) {
+      if (authentication?.session !== "verified") throw new Error("authentication failed");
+      return { subject_id: "user:avery" };
+    },
+  });
+  const runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { calls += 1; return { response_text: "Confirmed." }; } });
+  const waiting = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "External action.", idempotencyKey: "confirmation-required", capabilityGrant: highRiskGrant() });
+  assert.equal(waiting.status, "waiting_confirmation");
+  assert.equal(calls, 0);
+  await assert.rejects(runtime.resolveConfirmation({ confirmationId: waiting.confirmation_id, decision: "approve", authentication: { session: "forged" } }), /authentication failed/);
+  assert.equal(runtime.getRun(waiting.run_id).status, "waiting_confirmation");
+  const completed = await runtime.resolveConfirmation({ confirmationId: waiting.confirmation_id, decision: "approve", authentication: { session: "verified" } });
+  assert.equal(completed.status, "completed");
+  assert.equal(calls, 1);
+  runtime.close();
+});
+
+test("confirmation challenges cannot be resolved when the host has no verifier", async () => {
+  const time = new ManualTime();
+  const { options } = environment("confirmation-no-verifier", { clock: time.clock });
+  const runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { return { response_text: "Must not run." }; } });
+  const waiting = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "External action.", idempotencyKey: "confirmation-no-verifier", capabilityGrant: highRiskGrant() });
+  await assert.rejects(runtime.resolveConfirmation({ confirmationId: waiting.confirmation_id, decision: "approve", authentication: {} }), /confirmationVerifier is required/);
+  runtime.close();
+});
+
+test("a pending confirmation survives restart without running the adapter", async () => {
+  const time = new ManualTime();
+  const verifier = ({ authentication }) => {
+    if (authentication?.session !== "verified") throw new Error("authentication failed");
+    return { subject_id: "user:avery" };
+  };
+  const { options } = environment("confirmation-restart", { clock: time.clock, confirmationVerifier: verifier });
+  let runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { throw new Error("first process must not generate"); } });
+  const waiting = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "External action.", idempotencyKey: "confirmation-restart", capabilityGrant: highRiskGrant() });
+  runtime.close();
+
+  runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { return { response_text: "Confirmed after restart." }; } });
+  assert.equal(runtime.getRun(waiting.run_id).status, "waiting_confirmation");
+  const completed = await runtime.resolveConfirmation({ confirmationId: waiting.confirmation_id, decision: "approve", authentication: { session: "verified" } });
+  assert.equal(completed.status, "completed");
+  runtime.close();
+});
+
+test("a running adapter can be cancelled before any materialization", async () => {
+  const { options } = environment("cancel");
+  const runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { return new Promise(() => {}); } });
+  const queued = runtime.queueRequest({ roomId: "room:test", agentId: "agent:lantern", message: "Wait.", idempotencyKey: "cancel-running-adapter" });
+  const execution = runtime.executeRun(queued.run_id);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.cancelRun(queued.run_id).status, "cancelled");
+  assert.equal((await execution).status, "cancelled");
+  assert.equal(runtime.store.count("artifacts"), 0);
+  assert.equal(runtime.getAudit(queued.run_id).filter((event) => event.event_type === "run_cancelled").length, 1);
+  runtime.close();
+});
+
+test("fake time deterministically triggers a timeout", async () => {
+  const time = new ManualTime();
+  const { options } = environment("timeout", { clock: time.clock, timer: time, defaultTimeoutMs: 50 });
+  const runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { return new Promise(() => {}); } });
+  const execution = runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Timeout.", idempotencyKey: "fake-clock-timeout" });
+  await new Promise((resolve) => setImmediate(resolve));
+  time.advance(50);
+  const run = await execution;
+  assert.equal(run.status, "timed_out");
+  assert.equal(run.error.name, "ExecutionTimeoutError");
+  assert.equal(runtime.getAudit(run.run_id).some((event) => event.event_type === "run_timed_out"), true);
+  runtime.close();
+});
+
+test("retry budgets stop repeated failed execution", async () => {
+  const { options } = environment("retry-budget");
+  const runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { throw new Error("repeat failure"); } });
+  const first = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Fail.", idempotencyKey: "retry-budget-test", maxAttempts: 2 });
+  const second = await runtime.retryRun(first.run_id);
+  assert.equal(second.status, "failed");
+  assert.equal(second.attempts, 2);
+  await assert.rejects(runtime.retryRun(first.run_id), /failed to requeue run/);
+  runtime.close();
+});
+
+test("an unexpired scheduler lease blocks a second runtime and expires under fake time", async () => {
+  const time = new ManualTime();
+  const { options } = environment("lease-expiry", { clock: time.clock });
+  let first = new HouseRuntime({ ...options, runtimeId: "runtime:dead" });
+  const queued = first.queueRequest({ roomId: "room:test", agentId: "agent:lantern", message: "Resume after lease.", idempotencyKey: "lease-expiry-test" });
+  first.store.acquireLease({
+    protocol_version: "0.2",
+    lease_id: "lease:fictional:crashed",
+    run_id: queued.run_id,
+    work_ref: { ref_id: queued.run_id, kind: "other", locator: `runs/${queued.run_id}` },
+    holder_id: "runtime:dead",
+    status: "active",
+    acquired_at: time.clock().toISOString(),
+    expires_at: new Date(time.now + 1000).toISOString(),
+  });
+  first.close();
+
+  const second = new HouseRuntime({ ...options, runtimeId: "runtime:recovery" }).registerAgent("agent:lantern", { async generate() { return { response_text: "Recovered." }; } });
+  assert.equal((await second.executeRun(queued.run_id)).status, "queued");
+  time.advance(1001);
+  assert.equal((await second.executeRun(queued.run_id)).status, "completed");
+  second.close();
+});
+
+test("opening a second live Runtime does not reset another holder's running attempt", async () => {
+  const { options } = environment("live-lease-holder");
+  const first = new HouseRuntime({ ...options, runtimeId: "runtime:first" }).registerAgent("agent:lantern", { async generate() { return new Promise(() => {}); } });
+  const queued = first.queueRequest({ roomId: "room:test", agentId: "agent:lantern", message: "Stay active.", idempotencyKey: "live-lease-holder" });
+  const execution = first.executeRun(queued.run_id);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(first.getRun(queued.run_id).status, "running");
+  assert.equal(first.getRun(queued.run_id).attempts, 1);
+
+  const second = new HouseRuntime({ ...options, runtimeId: "runtime:second" }).registerAgent("agent:lantern", { async generate() { throw new Error("lease must block this adapter"); } });
+  const blocked = await second.executeRun(queued.run_id);
+  assert.equal(blocked.status, "running");
+  assert.equal(blocked.attempts, 1);
+  first.cancelRun(queued.run_id);
+  await execution;
+  first.close();
+  second.close();
+});
+
+test("resignatures form an append-only interpretation chain", async () => {
+  const { options } = environment("resignature", { memoryPolicy: fictionalMemoryPolicy() });
+  const runtime = new HouseRuntime(options).registerAgent("agent:lantern", lanternAdapter);
+  await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "First reflection.", idempotencyKey: "resignature-first" });
+  await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Second reflection.", idempotencyKey: "resignature-second" });
+  const records = runtime.listResignatures("agent:lantern");
+  assert.deepEqual(records.map((item) => item.layer), [2, 1]);
+  assert.equal(records[0].previous_resignature_id, records[1].resignature_id);
+  runtime.close();
+});
+
+test("the explicit Memory Port is used for reads, memories, and resignatures", async () => {
+  const { options } = environment("memory-port");
+  let base;
+  const calls = [];
+  const memoryPort = {
+    list(...args) { calls.push("list"); return base.list(...args); },
+    save(...args) { calls.push("save"); return base.save(...args); },
+    saveResignature(...args) { calls.push("saveResignature"); return base.saveResignature(...args); },
+    latestResignature(...args) { calls.push("latestResignature"); return base.latestResignature(...args); },
+    listResignatures(...args) { calls.push("listResignatures"); return base.listResignatures(...args); },
+  };
+  const runtime = new HouseRuntime({ ...options, memoryPort, memoryPolicy: fictionalMemoryPolicy() });
+  base = new SQLiteMemoryPort(runtime.store);
+  runtime.registerAgent("agent:lantern", lanternAdapter);
+  await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Use port.", idempotencyKey: "memory-port-test" });
+  runtime.listResignatures("agent:lantern");
+  assert.equal(new Set(calls).size, 5);
+  runtime.close();
+});
+
+test("a schema version 1 database upgrades forward without rebuilding runs", () => {
+  const root = mkdtempSync(join(tmpdir(), "house-runtime-migration-"));
+  const path = join(root, "runtime.db");
+  const old = new DatabaseSync(path);
+  old.exec("CREATE TABLE runtime_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO runtime_meta VALUES ('schema_version', '1'); CREATE TABLE runs (run_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, agent_id TEXT NOT NULL, request_event_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed')), result_json TEXT, error_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); INSERT INTO runs VALUES ('run:legacy:1', 'room:legacy', 'agent:lantern', 'event:legacy:1', 'queued', NULL, NULL, '2032-04-05T09:00:00.000Z', '2032-04-05T09:00:00.000Z');");
+  old.close();
+  const store = new RuntimeStore(path);
+  const columns = store.db.prepare("PRAGMA table_info(runs)").all().map((item) => item.name);
+  assert.equal(columns.includes("attempts"), true);
+  assert.equal(columns.includes("max_attempts"), true);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM run_controls WHERE run_id = 'run:legacy:1'").get().count, 1);
+  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "2");
+  store.close();
+});
+
+test("a newer database schema is rejected instead of silently downgraded", () => {
+  const root = mkdtempSync(join(tmpdir(), "house-runtime-future-schema-"));
+  const path = join(root, "runtime.db");
+  const future = new DatabaseSync(path);
+  future.exec("CREATE TABLE runtime_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO runtime_meta VALUES ('schema_version', '9');");
+  future.close();
+  assert.throws(() => new RuntimeStore(path), /newer than supported schema 2/);
 });
 
 test("Runtime passes the shared v0.1-to-v0.2 migration fixture set", () => {

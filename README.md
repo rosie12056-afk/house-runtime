@@ -2,7 +2,7 @@
 
 House Runtime is an experimental, model-independent runtime for persistent single-user agent systems. It provides durable runs, per-room generation queues, protocol-validated context and evidence, immutable Keel revisions, policy-gated memory writes, local artifacts, and an outbox that survives process restarts.
 
-The current development line explicitly writes House Protocols `0.2` documents while retaining read compatibility for stored `0.1` records. It locks Protocols and Toolkit release-candidate tags; neither dependency floats automatically.
+Alpha.2 explicitly writes House Protocols `0.2` documents while retaining read compatibility for stored `0.1` records. It locks Protocols and Toolkit release-candidate tags; neither dependency floats automatically.
 
 The runtime contains no real House instance, agent personality, relationship, schedule, connector, or private data.
 
@@ -28,6 +28,17 @@ This repository is the execution layer. It does not redefine protocol truth or s
 8. An agent-authored reflection is stored only when the instance Memory Policy allows or quarantines it.
 9. The response Event enters a durable Outbox.
 10. A restarted process can resume queued or interrupted Runs without asking the adapter to regenerate a saved proposal.
+
+## Execution control
+
+- Every execution attempt acquires a persisted Scheduler Lease with a monotonic fencing token. A second Runtime cannot execute the same Run until an old lease expires.
+- Adapter generation has a bounded timeout and receives an `AbortSignal`. Cancellation and timeout occur before proposal materialization, so a late model response cannot write artifacts.
+- Each Run has a persisted retry budget. Exhausted attempts cannot be reset by a model response.
+- A `capability_grant` with `confirmation_mode: "each_use"` creates a durable confirmation challenge before generation starts.
+- Confirmation requires an instance-supplied `confirmationVerifier`. The Runtime does not trust a caller-provided user name, request header, or model statement as authentication.
+- Control transitions are written to an audit log without storing authentication secrets.
+
+The Runtime does not implement login or session verification itself. A host application verifies its Secure/HttpOnly session and returns only a verified subject identifier from `confirmationVerifier`.
 
 ## Five-minute demo
 
@@ -68,6 +79,8 @@ The adapter cannot set an Initiative to `completed`, invent an action result, or
 - Real Keels remain Instance data.
 - Memory candidates require an instance-provided policy callback. No callback means no memory write.
 - Memory content, Evidence, and retrieval confidence remain separate concepts.
+- Accepted agent reflection creates an append-only Resignature linked to the source Event and runtime-derived Evidence; it never overwrites the source memory.
+- `SQLiteMemoryPort` is the alpha.2 local implementation. The interface is explicit but not stable until a second independent adapter passes v0.3 conformance.
 
 ## Development
 
@@ -77,14 +90,14 @@ npm run check
 
 House Runtime requires Node.js 22.13 or newer and uses the built-in `node:sqlite` module. Node currently labels that API as active development and may print an experimental warning. Database access is isolated behind `RuntimeStore`, and the repository remains an alpha release until that dependency surface is stable.
 
-See [ROADMAP.md](ROADMAP.md), [COMPATIBILITY.md](COMPATIBILITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md).
+See [MIGRATION.md](MIGRATION.md), [ROADMAP.md](ROADMAP.md), [COMPATIBILITY.md](COMPATIBILITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md).
 
 ## Not included
 
 - Model provider clients or prompts.
 - Email, Telegram, forum, game, browser, search, or other external connectors.
 - Production authentication or a public HTTP server.
-- Scheduler, Life Clock, tick, dream, journal, or handoff modules; these are later Runtime milestones.
+- Life Clock, tick, dream, journal, or handoff modules; these are v0.2 milestones.
 - House Console.
 
 ## License

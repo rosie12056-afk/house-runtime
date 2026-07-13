@@ -46,7 +46,7 @@ const harborRun = await runtime.submit({
 if (harborRun.status !== "completed") throw new Error(`Harbor run failed: ${harborRun.error?.message}`);
 
 const countsBeforeRestart = Object.fromEntries(
-  ["runs", "events", "context_manifests", "proposals", "artifacts", "evidence_bundles", "initiatives", "memories", "keels", "outbox"]
+  ["runs", "events", "context_manifests", "proposals", "artifacts", "evidence_bundles", "initiatives", "memories", "resignatures", "scheduler_leases", "audit_events", "keels", "outbox"]
     .map((table) => [table, runtime.store.count(table)]),
 );
 runtime.close();
@@ -62,6 +62,7 @@ console.log("House Runtime demo: PASS");
 console.log("- two fictional agents completed linked artifact work");
 console.log("- initiatives completed only after runtime-verified actions, outputs, and evidence");
 console.log("- Keel and memory policy records persisted");
+console.log("- scheduler leases, audit events, and append-only resignatures persisted");
 console.log(`- persisted counts: ${JSON.stringify(countsBeforeRestart)}`);
 console.log(`- pending outbox events survived restart: ${pendingBeforeDelivery}`);
 console.log(`- locally delivered events: ${delivered.length}`);
