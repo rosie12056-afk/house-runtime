@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { HouseRuntime } from "../src/index.mjs";
+import { runMigrationConformance } from "house-toolkit/src/conformance.mjs";
 import { fictionalMemoryPolicy, lanternAdapter, lanternKeel } from "../demo/fixtures.mjs";
+
+const protocolsRoot = resolve(dirname(fileURLToPath(import.meta.resolve("house-protocols"))), "..");
 
 function environment(name, overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), `house-runtime-${name}-`));
@@ -22,13 +26,15 @@ function allowPolicy(decision = "allow") {
   return {
     decide({ candidate }) {
       return {
-        protocol_version: "0.1",
+        protocol_version: "0.2",
         decision_id: `decision:${candidate.memory_id.slice("memory:".length)}`,
         operation: "write",
         subject_id: candidate.subject_id,
         resource_ref: { ref_id: candidate.memory_id, kind: "memory", locator: `memories/${candidate.memory_id}` },
+        source_class: "system_derived",
         decision,
         reason_codes: ["test_policy"],
+        evidence_refs: candidate.evidence_refs,
         decided_at: candidate.created_at,
         policy_version: "test-1",
       };
@@ -48,11 +54,34 @@ test("a durable work run links actual artifacts, evidence, initiative, memory, a
   assert.match(runtime.readArtifact(run.result.artifact_ids[0]), /Observation:/);
   assert.equal(runtime.getInitiative(run.run_id).status, "completed");
   assert.equal(runtime.getEvidence(run.run_id).claims[0].claim_type, "action_result");
+  assert.equal(runtime.getEvidence(run.run_id).protocol_version, "0.2");
+  assert.equal(runtime.getManifest(run.run_id).protocol_version, "0.2");
   assert.equal(runtime.listMemories("agent:lantern").length, 1);
   assert.equal(runtime.store.listOutbox("pending").length, 1);
   assert.equal(JSON.stringify(runtime.getManifest(run.run_id)).includes(message), false);
   assert.equal(runtime.getManifest(run.run_id).entries.some((entry) => entry.locator.includes("keels/")), true);
   assert.equal(statSync(options.dbPath).mode & 0o777, 0o600);
+  runtime.close();
+});
+
+test("Runtime passes the shared v0.1-to-v0.2 migration fixture set", () => {
+  const report = runMigrationConformance(join(protocolsRoot, "fixtures", "migrations", "v0.1-to-v0.2.json"));
+  assert.equal(report.ok, true);
+  assert.equal(report.summary.records_checked, 7);
+});
+
+test("stored v0.1 events remain readable after new writes move to v0.2", async () => {
+  const { options } = environment("protocol-upgrade");
+  let runtime = new HouseRuntime({ ...options, protocolVersion: "0.1" }).registerAgent("agent:lantern", { async generate() { return { response_text: "Old profile." }; } });
+  const oldRun = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Old.", idempotencyKey: "protocol-old-record" });
+  const oldEventId = runtime.getRun(oldRun.run_id).request_event_id;
+  assert.equal(runtime.store.getEvent(oldEventId).protocol_version, "0.1");
+  runtime.close();
+
+  runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { return { response_text: "New profile." }; } });
+  assert.equal(runtime.store.getEvent(oldEventId).protocol_version, "0.1");
+  const newRun = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "New.", idempotencyKey: "protocol-new-record" });
+  assert.equal(runtime.store.getEvent(runtime.getRun(newRun.run_id).request_event_id).protocol_version, "0.2");
   runtime.close();
 });
 
@@ -154,13 +183,15 @@ test("a failed run can retry from its persisted proposal without regenerating", 
       policyCalls += 1;
       if (policyCalls === 1) throw new Error("temporary policy failure");
       return {
-        protocol_version: "0.1",
+        protocol_version: "0.2",
         decision_id: `decision:${candidate.memory_id.slice("memory:".length)}`,
         operation: "write",
         subject_id: candidate.subject_id,
         resource_ref: { ref_id: candidate.memory_id, kind: "memory", locator: `memories/${candidate.memory_id}` },
+        source_class: "system_derived",
         decision: "allow",
         reason_codes: ["retry_test"],
+        evidence_refs: candidate.evidence_refs,
         decided_at: candidate.created_at,
         policy_version: "test-1",
       };

@@ -2,6 +2,8 @@
 
 House Runtime is an experimental, model-independent runtime for persistent single-user agent systems. It provides durable runs, per-room generation queues, protocol-validated context and evidence, immutable Keel revisions, policy-gated memory writes, local artifacts, and an outbox that survives process restarts.
 
+The current development line explicitly writes House Protocols `0.2` documents while retaining read compatibility for stored `0.1` records. It locks Protocols and Toolkit release-candidate tags; neither dependency floats automatically.
+
 The runtime contains no real House instance, agent personality, relationship, schedule, connector, or private data.
 
 ## House open-source stack

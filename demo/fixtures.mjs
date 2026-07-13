@@ -36,7 +36,7 @@ export function fictionalMemoryPolicy() {
   return {
     decide({ candidate }) {
       return {
-        protocol_version: "0.1",
+        protocol_version: "0.2",
         decision_id: `decision:${candidate.memory_id.slice("memory:".length)}`,
         operation: "write",
         subject_id: candidate.subject_id,
@@ -45,8 +45,10 @@ export function fictionalMemoryPolicy() {
           kind: "memory",
           locator: `memories/${candidate.memory_id}`,
         },
+        source_class: "system_derived",
         decision: candidate.kind === "reflection" ? "allow" : "quarantine",
         reason_codes: ["fictional_demo_agent_authored"],
+        evidence_refs: candidate.evidence_refs,
         decided_at: candidate.created_at,
         policy_version: "fictional-demo-1",
       };

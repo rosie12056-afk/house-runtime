@@ -1,4 +1,4 @@
-import { assertProtocol } from "house-protocols";
+import { assertProtocol, protocolProfiles } from "house-protocols";
 import { createId, isoTime, runScopedId } from "./ids.mjs";
 import { RoomQueue } from "./room-queue.mjs";
 import { RuntimeStore } from "./store.mjs";
@@ -13,7 +13,7 @@ function normalizeReference(reference) {
   assertString(reference.ref_id, "context reference ref_id", 160);
   assertString(reference.kind, "context reference kind", 40);
   assertString(reference.locator, "context reference locator", 1024);
-  const allowedKinds = new Set(["event", "message", "memory", "artifact", "source", "claim", "evidence", "other"]);
+  const allowedKinds = new Set(["event", "message", "memory", "artifact", "source", "claim", "evidence", "lifecycle", "scheduler_lease", "capability_grant", "other"]);
   if (!allowedKinds.has(reference.kind)) throw new Error(`unsupported context reference kind: ${reference.kind}`);
   return {
     ref_id: reference.ref_id,
@@ -61,11 +61,13 @@ export class HouseRuntime {
   #agents = new Map();
   #scheduled = new Map();
 
-  constructor({ dbPath, workspaceDir, instanceId = "instance:fictional-demo", userId = "user:avery", clock = () => new Date(), memoryPolicy = null }) {
+  constructor({ dbPath, workspaceDir, instanceId = "instance:fictional-demo", userId = "user:avery", protocolVersion = "0.2", clock = () => new Date(), memoryPolicy = null }) {
     assertString(instanceId, "instanceId", 160);
     assertString(userId, "userId", 160);
+    if (!protocolProfiles().includes(protocolVersion)) throw new Error(`unsupported protocolVersion: ${protocolVersion}`);
     this.instanceId = instanceId;
     this.userId = userId;
+    this.protocolVersion = protocolVersion;
     this.clock = clock;
     this.memoryPolicy = memoryPolicy;
     this.store = new RuntimeStore(dbPath);
@@ -103,7 +105,7 @@ export class HouseRuntime {
 
     const at = isoTime(this.clock);
     const event = {
-      protocol_version: "0.1",
+      protocol_version: this.protocolVersion,
       event_id: createId("event"),
       event_type: "user:message",
       source: this.userId,
@@ -234,7 +236,7 @@ export class HouseRuntime {
       });
     }
     const manifest = {
-      protocol_version: "0.1",
+      protocol_version: this.protocolVersion,
       manifest_id: runScopedId("manifest", run.run_id),
       run_id: run.run_id,
       subject_id: run.agent_id,
@@ -274,7 +276,7 @@ export class HouseRuntime {
 
     if (proposal.work) {
       const active = {
-        protocol_version: "0.1",
+        protocol_version: this.protocolVersion,
         initiative_id: initiativeId,
         owner_id: run.agent_id,
         goal: proposal.work.goal,
@@ -294,7 +296,7 @@ export class HouseRuntime {
       });
       const finishedAt = isoTime(this.clock);
       evidence = {
-        protocol_version: "0.1",
+        protocol_version: this.protocolVersion,
         bundle_id: evidenceId,
         created_at: finishedAt,
         claims: artifacts.map((artifact, index) => ({
@@ -369,7 +371,7 @@ export class HouseRuntime {
 
     const responseAt = isoTime(this.clock);
     const responseEvent = {
-      protocol_version: "0.1",
+      protocol_version: this.protocolVersion,
       event_id: runScopedId("event", run.run_id, "response"),
       event_type: "agent:message",
       source: run.agent_id,
