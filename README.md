@@ -6,6 +6,8 @@ Runtime v0.2 adds a host-polled 24-hour lifecycle on top of alpha.2 control. It 
 
 The unreleased `t4-portability` branch contains a v0.3 Memory Port candidate. Two standalone adapters use their own data files rather than RuntimeStore tables: `SQLiteMemoryAdapter` and `JsonFileMemoryAdapter`. Both expose an asynchronous API and pass the same Toolkit conformance suite. The released Runtime still uses the v0.2 embedded port until durable adapter-operation delivery is complete.
 
+The branch also contains a transport-neutral `RuntimeService`, a direct module client, and a JSON serialization client. Sensitive methods fail closed without a host authorization callback. Authentication context is attached by the host transport and is never accepted from request parameters.
+
 The runtime contains no real House instance, agent personality, relationship, schedule, connector, or private data.
 
 ## House open-source stack
