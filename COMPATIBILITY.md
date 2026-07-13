@@ -2,12 +2,12 @@
 
 ## Current release
 
-The released `v0.1.0-alpha.1` remains pinned to the v0.1 stack. Alpha.2 uses exact release-candidate tags and committed lockfile SHAs:
+The released `v0.1.0-alpha.1` remains pinned to the v0.1 stack. Alpha.2.1 uses exact stable v0.2 tags and committed lockfile SHAs:
 
 | Dependency | Locked release | Role | Loaded at runtime |
 | --- | --- | --- | --- |
-| House Protocols | `v0.2.0-rc.1` | Separate `0.1` and `0.2` schema and semantic validation | Yes |
-| House Toolkit | `v0.2.0-rc.1` | Migration, privacy, and conformance checks during development and release | No; development dependency only |
+| House Protocols | `v0.2.0` | Separate `0.1` and `0.2` schema and semantic validation | Yes |
+| House Toolkit | `v0.2.0` | Migration, privacy, and conformance checks during development and release | No; development dependency only |
 
 The Runtime requires Node.js 22.13 or newer and is tested on Node 22 and 24.
 
@@ -24,7 +24,7 @@ The Runtime requires Node.js 22.13 or newer and is tested on Node 22 and 24.
 | Runtime | Protocol document profile | Toolkit profile | Status |
 | --- | --- | --- | --- |
 | `v0.1.0-alpha.1` | `0.1` | Toolkit `v0.1.1` | Tested and released |
-| `v0.1.0-alpha.2` | writes `0.2` and retains stored `0.1` reads | Toolkit `v0.2.0-rc.1` | Tested; shared migrations, restart confirmation, lease expiry, cancellation, timeout, and retry boundaries pass |
+| `v0.1.0-alpha.2.1` | writes `0.2` and retains stored `0.1` reads | Toolkit `v0.2.0` | Tested; shared migrations, restart confirmation, lease expiry, cancellation, timeout, and retry boundaries pass |
 | planned v0.2 | v0.2 plus lifecycle contracts | Toolkit v0.2 or later compatible profile | Not yet implemented |
 
 Compatibility is established by fixtures and restart tests, not by similar version labels.
