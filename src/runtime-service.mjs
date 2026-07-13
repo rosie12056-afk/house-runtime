@@ -1,10 +1,14 @@
 import { createId } from "./ids.mjs";
+import { assertProtocol, validateProtocol } from "house-protocols";
 
 const METHODS = Object.freeze(new Set(["runtime.health", "run.submit", "run.get", "memory.query", "lifecycle.query"]));
 const RESERVED_AUTH_KEYS = Object.freeze(new Set(["auth", "authentication", "authenticated_by", "cookie", "principal", "session", "token"]));
 
 function errorResponse(requestId, code, message) {
-  return { request_id: requestId || null, ok: false, error: { code, message } };
+  const safeRequestId = typeof requestId === "string" && /^[A-Za-z][A-Za-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(requestId) && requestId.length <= 160 ? requestId : null;
+  const response = { protocol_version: "0.2", request_id: safeRequestId, ok: false, error: { code, message } };
+  assertProtocol("runtime_response", response, { profile: "0.2" });
+  return response;
 }
 
 function containsReservedAuthField(value) {
@@ -18,7 +22,7 @@ function assertOnlyKeys(value, keys, label) {
 }
 
 export class RuntimeService {
-  constructor(runtime, { authorize = null, runtimeVersion = "0.3.0-rc.0" } = {}) {
+  constructor(runtime, { authorize = null, runtimeVersion = "0.3.0-rc.1" } = {}) {
     if (!runtime || typeof runtime.submit !== "function") throw new Error("runtime is required");
     this.runtime = runtime;
     this.authorize = authorize;
@@ -31,9 +35,10 @@ export class RuntimeService {
     if (typeof requestId !== "string" || requestId.length === 0 || typeof request.method !== "string" || request.method.length === 0 || !request.params || typeof request.params !== "object" || Array.isArray(request.params)) {
       return errorResponse(requestId, "E_BAD_REQUEST", "request_id, method, and object params are required");
     }
-    if (Object.keys(request).some((key) => !new Set(["request_id", "method", "params"]).has(key))) return errorResponse(requestId, "E_BAD_REQUEST", "request envelope contains unsupported fields");
+    if (Object.keys(request).some((key) => !new Set(["protocol_version", "request_id", "method", "params"]).has(key))) return errorResponse(requestId, "E_BAD_REQUEST", "request envelope contains unsupported fields");
     if (containsReservedAuthField(request.params)) return errorResponse(requestId, "E_RESERVED_AUTH_FIELD", "authentication identity must be supplied by the host transport");
     if (!METHODS.has(request.method)) return errorResponse(requestId, "E_METHOD_NOT_FOUND", "unsupported Runtime method");
+    if (!validateProtocol("runtime_request", request, { profile: "0.2" }).ok) return errorResponse(requestId, "E_BAD_REQUEST", "request does not match the Runtime API contract");
 
     if (request.method !== "runtime.health") {
       if (typeof this.authorize !== "function") return errorResponse(requestId, "E_UNAUTHORIZED", "host authorization is required");
@@ -48,7 +53,9 @@ export class RuntimeService {
 
     try {
       const result = await this.#dispatch(request.method, request.params);
-      return { request_id: requestId, ok: true, result };
+      const response = { protocol_version: "0.2", request_id: requestId, ok: true, result };
+      assertProtocol("runtime_response", response, { profile: "0.2" });
+      return response;
     } catch (error) {
       return errorResponse(requestId, error?.code || "E_RUNTIME_OPERATION", error?.code ? error.message : "Runtime operation failed");
     }
@@ -107,7 +114,7 @@ export class DirectRuntimeClient extends RuntimeClientBase {
   }
 
   async request(method, params = {}) {
-    const envelope = { request_id: createId("request"), method, params: structuredClone(params) };
+    const envelope = { protocol_version: "0.2", request_id: createId("request"), method, params: structuredClone(params) };
     return this.unwrap(await this.service.handle(envelope, { authContext: await this.authContextProvider() }));
   }
 }
@@ -120,7 +127,7 @@ export class JsonRuntimeClient extends RuntimeClientBase {
   }
 
   async request(method, params = {}) {
-    const envelope = { request_id: createId("request"), method, params: structuredClone(params) };
+    const envelope = { protocol_version: "0.2", request_id: createId("request"), method, params: structuredClone(params) };
     const raw = await this.exchange(JSON.stringify(envelope));
     let response;
     try {

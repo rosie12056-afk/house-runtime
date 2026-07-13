@@ -43,7 +43,7 @@ test("JSON transport attaches authentication outside the client envelope", async
   let observed = null;
   const service = new RuntimeService(runtime, { authorize: async ({ authContext }) => { observed = authContext; return { subjectId: "user:avery" }; } });
   const exchange = createJsonRuntimeExchange(service, { authContextProvider: async () => ({ transportSession: "fictional-host-only" }) });
-  const response = JSON.parse(await exchange(JSON.stringify({ request_id: "request:fictional:one", method: "run.get", params: { runId: "run:fictional:missing" } })));
+  const response = JSON.parse(await exchange(JSON.stringify({ protocol_version: "0.2", request_id: "request:fictional:one", method: "run.get", params: { runId: "run:fictional:missing" } })));
   assert.equal(response.ok, true);
   assert.deepEqual(observed, { transportSession: "fictional-host-only" });
   runtime.close();

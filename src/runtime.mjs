@@ -3,6 +3,7 @@ import { ExecutionCancelledError, ExecutionTimeoutError, runWithControls } from 
 import { createId, isoTime, runScopedId, sha256 } from "./ids.mjs";
 import { LifeClock } from "./life-clock.mjs";
 import { assertMemoryPort, SQLiteMemoryPort } from "./memory-port.mjs";
+import { assertMemoryPortCandidate } from "./memory-port-candidate.mjs";
 import { RoomQueue } from "./room-queue.mjs";
 import { RuntimeStore } from "./store.mjs";
 import { Workspace } from "./workspace.mjs";
@@ -85,7 +86,7 @@ export class HouseRuntime {
   #leases = new Map();
   #lifecycles = new Map();
 
-  constructor({ dbPath, workspaceDir, instanceId = "instance:fictional-demo", userId = "user:avery", runtimeId = createId("runtime"), protocolVersion = "0.2", clock = () => new Date(), timer, leaseMs = 30000, defaultTimeoutMs = 120000, defaultMaxAttempts = 3, confirmationVerifier = null, memoryPolicy = null, memoryPort = null }) {
+  constructor({ dbPath, workspaceDir, instanceId = "instance:fictional-demo", userId = "user:avery", runtimeId = createId("runtime"), protocolVersion = "0.2", clock = () => new Date(), timer, leaseMs = 30000, defaultTimeoutMs = 120000, defaultMaxAttempts = 3, confirmationVerifier = null, memoryPolicy = null, memoryPort = null, memoryAdapter = null, memoryOperationMaxAttempts = 5 }) {
     assertString(instanceId, "instanceId", 160);
     assertString(userId, "userId", 160);
     assertString(runtimeId, "runtimeId", 160);
@@ -93,6 +94,8 @@ export class HouseRuntime {
     if (!Number.isInteger(leaseMs) || leaseMs < 1000) throw new Error("leaseMs must be an integer of at least 1000");
     if (!Number.isInteger(defaultTimeoutMs) || defaultTimeoutMs < 1) throw new Error("defaultTimeoutMs must be a positive integer");
     if (!Number.isInteger(defaultMaxAttempts) || defaultMaxAttempts < 1 || defaultMaxAttempts > 20) throw new Error("defaultMaxAttempts must be between 1 and 20");
+    if (!Number.isInteger(memoryOperationMaxAttempts) || memoryOperationMaxAttempts < 1 || memoryOperationMaxAttempts > 20) throw new Error("memoryOperationMaxAttempts must be between 1 and 20");
+    if (memoryPort && memoryAdapter) throw new Error("memoryPort and memoryAdapter cannot both be configured");
     this.instanceId = instanceId;
     this.userId = userId;
     this.runtimeId = runtimeId;
@@ -104,8 +107,10 @@ export class HouseRuntime {
     this.defaultMaxAttempts = defaultMaxAttempts;
     this.confirmationVerifier = confirmationVerifier;
     this.memoryPolicy = memoryPolicy;
+    this.memoryOperationMaxAttempts = memoryOperationMaxAttempts;
     this.store = new RuntimeStore(dbPath);
     this.memoryPort = assertMemoryPort(memoryPort || new SQLiteMemoryPort(this.store));
+    this.memoryAdapter = memoryAdapter ? assertMemoryPortCandidate(memoryAdapter) : null;
     this.workspace = new Workspace(workspaceDir);
     this.roomQueue = new RoomQueue();
   }
@@ -178,11 +183,12 @@ export class HouseRuntime {
         const controller = new AbortController();
         let decision;
         try {
+          const memories = await this.#queryMemories(currentSubject, 20);
           decision = validateLifecycleDecision(await runWithControls(() => registration.adapter.consider({
             opportunity: structuredClone(opportunity),
             life_state: structuredClone(lifeState),
             context: {
-              memories: structuredClone(this.memoryPort.list(currentSubject, 20)),
+              memories: structuredClone(memories),
               journals: structuredClone(this.store.listLifecycleRecords(currentSubject, "journal", 5)),
               dreams: structuredClone(this.store.listLifecycleRecords(currentSubject, "dream", 5)),
               handoffs: structuredClone(this.store.listLifecycleRecords(currentSubject, "handoff", 5)),
@@ -366,6 +372,7 @@ export class HouseRuntime {
   }
 
   async resumePending() {
+    if (this.memoryAdapter) await this.drainMemoryOperations();
     return Promise.all(this.store.listPendingRuns().map((run) => this.executeRun(run.run_id)));
   }
 
@@ -514,7 +521,7 @@ export class HouseRuntime {
 
     try {
       const event = this.store.getEvent(run.request_event_id);
-      const context = this.#buildContext(run, event, startedAt);
+      const context = await this.#buildContext(run, event, startedAt);
       let proposal = this.store.getProposal(runId);
       if (!proposal) {
         proposal = validateProposal(await runWithControls(() => adapter.generate({
@@ -599,9 +606,9 @@ export class HouseRuntime {
     return this.store.saveOpportunity(`feedback:${runId}`, opportunity, { maxAttempts: 1, retryDelayMinutes: 15 });
   }
 
-  #buildContext(run, event, at) {
+  async #buildContext(run, event, at) {
     const keel = this.store.getCurrentKeel(run.agent_id);
-    const memories = this.memoryPort.list(run.agent_id, 20);
+    const memories = await this.#queryMemories(run.agent_id, 20);
     const requestedRefs = (event.payload.context_refs || []).map(normalizeReference);
     const entries = [
       {
@@ -668,6 +675,7 @@ export class HouseRuntime {
     let memory = null;
     let memoryDecision = null;
     let resignature = null;
+    let expectedPreviousResignatureId = null;
 
     if (proposal.work) {
       const active = {
@@ -762,7 +770,8 @@ export class HouseRuntime {
         if (memoryDecision.decision === "quarantine") memory.status = "quarantined";
         else if (memoryDecision.decision !== "allow") memory = null;
         if (memory?.status === "active" && this.protocolVersion === "0.2") {
-          const previous = this.memoryPort.latestResignature(run.agent_id);
+          const previous = await this.#latestResignature(run.agent_id);
+          expectedPreviousResignatureId = previous?.resignature_id || null;
           resignature = {
             protocol_version: "0.2",
             resignature_id: runScopedId("resignature", run.run_id, "reflection"),
@@ -801,6 +810,27 @@ export class HouseRuntime {
     };
     assertProtocol("event", responseEvent);
     const outboxId = runScopedId("outbox", run.run_id, "response");
+    const memoryOperations = this.memoryAdapter && memory
+      ? [
+          {
+            operation_id: runScopedId("memory-operation", run.run_id, "reflection"),
+            run_id: run.run_id,
+            operation_kind: "put_memory",
+            max_attempts: this.memoryOperationMaxAttempts,
+            payload: { memory: structuredClone(memory) },
+            created_at: responseAt,
+          },
+          ...(resignature ? [{
+            operation_id: runScopedId("memory-operation", run.run_id, "resignature"),
+            run_id: run.run_id,
+            operation_kind: "append_resignature",
+            max_attempts: this.memoryOperationMaxAttempts,
+            depends_on: runScopedId("memory-operation", run.run_id, "reflection"),
+            payload: { expected_previous_id: expectedPreviousResignatureId, resignature: structuredClone(resignature) },
+            created_at: responseAt,
+          }] : []),
+        ]
+      : [];
     const result = {
       response_event_id: responseEvent.event_id,
       response_text: proposal.response_text,
@@ -809,6 +839,8 @@ export class HouseRuntime {
       artifact_ids: artifacts.map((artifact) => artifact.artifact_id),
       memory_id: memory?.memory_id || null,
       resignature_id: resignature?.resignature_id || null,
+      memory_operation_ids: memoryOperations.map((operation) => operation.operation_id),
+      memory_delivery_status: memory ? (this.memoryAdapter ? "pending" : "delivered") : null,
       outbox_id: outboxId,
     };
 
@@ -817,13 +849,110 @@ export class HouseRuntime {
       if (evidence) this.store.saveEvidence(run.run_id, evidence);
       if (initiative) this.store.saveInitiative(run.run_id, initiative);
       if (memoryDecision) this.store.saveMemoryPolicy(run.run_id, memoryDecision);
-      if (memory) this.memoryPort.save(run.run_id, memory);
-      if (resignature) this.memoryPort.saveResignature(run.run_id, resignature);
+      if (this.memoryAdapter) {
+        for (const operation of memoryOperations) this.store.enqueueMemoryOperation(operation);
+      } else {
+        if (memory) this.memoryPort.save(run.run_id, memory);
+        if (resignature) this.memoryPort.saveResignature(run.run_id, resignature);
+      }
       this.store.insertEvent(responseEvent, run.room_id);
       this.store.enqueueOutbox(run.run_id, outboxId, responseEvent.event_id, responseAt);
       this.store.completeRun(run.run_id, result, responseAt);
     });
-    return result;
+    if (memoryOperations.length) await this.drainMemoryOperations({ runId: run.run_id });
+    return this.store.getRun(run.run_id)?.result || result;
+  }
+
+  async drainMemoryOperations({ runId = null, retryFailed = false } = {}) {
+    if (!this.memoryAdapter) return [];
+    const startedAt = isoTime(this.clock);
+    if (retryFailed) this.store.requeueFailedMemoryOperations(runId, startedAt);
+    const operations = this.store.listMemoryOperations({ runId, statuses: ["pending"] });
+    const results = [];
+    const affectedRuns = new Set();
+    for (let operation of operations) {
+      affectedRuns.add(operation.run_id);
+      if (operation.document.depends_on) {
+        const dependency = this.store.getMemoryOperation(operation.document.depends_on);
+        if (dependency?.status !== "delivered") {
+          results.push({ operation_id: operation.operation_id, status: "blocked" });
+          continue;
+        }
+      }
+      try {
+        await this.#deliverMemoryOperation(operation);
+        operation = this.store.markMemoryOperationDelivered(operation.operation_id, isoTime(this.clock));
+        this.#audit(operation.run_id, "memory_operation_delivered", { operation_id: operation.operation_id, operation_kind: operation.operation_kind }, operation.updated_at);
+        results.push({ operation_id: operation.operation_id, status: "delivered" });
+      } catch (error) {
+        if (error?.code === "E_RESIGNATURE_CONFLICT" && operation.operation_kind === "append_resignature") {
+          try {
+            operation = await this.#rebaseResignatureOperation(operation);
+            await this.#deliverMemoryOperation(operation);
+            operation = this.store.markMemoryOperationDelivered(operation.operation_id, isoTime(this.clock));
+            this.#audit(operation.run_id, "resignature_operation_rebased", { operation_id: operation.operation_id }, operation.updated_at);
+            results.push({ operation_id: operation.operation_id, status: "delivered", rebased: true });
+            continue;
+          } catch (retryError) {
+            error = retryError;
+          }
+        }
+        const failed = this.store.recordMemoryOperationFailure(operation.operation_id, error?.code || error?.name || "E_MEMORY_ADAPTER", isoTime(this.clock));
+        this.#audit(operation.run_id, "memory_operation_failed", { operation_id: operation.operation_id, operation_kind: operation.operation_kind, error_code: failed.last_error_code, status: failed.status }, failed.updated_at);
+        results.push({ operation_id: operation.operation_id, status: failed.status, error_code: failed.last_error_code });
+      }
+    }
+    for (const affectedRunId of affectedRuns) this.#refreshRunMemoryDeliveryStatus(affectedRunId);
+    return results;
+  }
+
+  async #deliverMemoryOperation(operation) {
+    if (operation.operation_kind === "put_memory") {
+      return this.memoryAdapter.putMemory({ operationId: operation.operation_id, runId: operation.run_id, memory: structuredClone(operation.document.payload.memory) });
+    }
+    return this.memoryAdapter.appendResignature({
+      operationId: operation.operation_id,
+      runId: operation.run_id,
+      expectedPreviousId: operation.document.payload.expected_previous_id,
+      resignature: structuredClone(operation.document.payload.resignature),
+    });
+  }
+
+  async #rebaseResignatureOperation(operation) {
+    const latest = await this.memoryAdapter.latestResignature({ subjectId: operation.document.payload.resignature.subject_id });
+    const resignature = {
+      ...structuredClone(operation.document.payload.resignature),
+      ...(latest ? { previous_resignature_id: latest.resignature_id } : {}),
+      layer: (latest?.layer || 0) + 1,
+    };
+    if (!latest) delete resignature.previous_resignature_id;
+    assertProtocol("resignature", resignature, { profile: "0.2" });
+    const document = {
+      ...operation.document,
+      payload: { expected_previous_id: latest?.resignature_id || null, resignature },
+    };
+    return this.store.updateMemoryOperationDocument(operation.operation_id, document, isoTime(this.clock));
+  }
+
+  #refreshRunMemoryDeliveryStatus(runId) {
+    const operations = this.store.listMemoryOperations({ runId, statuses: ["pending", "delivered", "failed"] });
+    if (!operations.length) return;
+    const status = operations.some((operation) => operation.status === "failed")
+      ? "failed"
+      : operations.every((operation) => operation.status === "delivered") ? "delivered" : "pending";
+    this.store.setRunMemoryDeliveryStatus(runId, status, isoTime(this.clock));
+  }
+
+  async #queryMemories(subjectId, limit = 20, options = {}) {
+    return this.memoryAdapter
+      ? this.memoryAdapter.queryMemories({ subjectId, limit, includeQuarantined: options.includeQuarantined ?? false })
+      : this.memoryPort.list(subjectId, limit, options);
+  }
+
+  async #latestResignature(subjectId) {
+    return this.memoryAdapter
+      ? this.memoryAdapter.latestResignature({ subjectId })
+      : this.memoryPort.latestResignature(subjectId);
   }
 
   async drainOutbox(deliver, { retryFailed = false } = {}) {
@@ -875,12 +1004,18 @@ export class HouseRuntime {
     return this.workspace.readArtifact(artifact.locator);
   }
 
-  listMemories(subjectId, limit = 20, options = {}) {
-    return this.memoryPort.list(subjectId, limit, options);
+  async listMemories(subjectId, limit = 20, options = {}) {
+    return this.#queryMemories(subjectId, limit, options);
   }
 
-  listResignatures(subjectId, limit = 20) {
-    return this.memoryPort.listResignatures(subjectId, limit);
+  async listResignatures(subjectId, limit = 20) {
+    return this.memoryAdapter
+      ? this.memoryAdapter.queryResignatures({ subjectId, limit })
+      : this.memoryPort.listResignatures(subjectId, limit);
+  }
+
+  listMemoryOperations(options = {}) {
+    return this.store.listMemoryOperations({ ...options, statuses: options.statuses || ["pending", "delivered", "failed"] });
   }
 
   getLifeState(subjectId) {

@@ -6,7 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { HouseRuntime, LifeClock, RuntimeStore, SQLiteMemoryPort } from "../src/index.mjs";
-import { runLifecycleConformance, runMigrationConformance } from "house-toolkit/src/conformance.mjs";
+import { runLifecycleConformance, runMigrationConformance, runRuntimeApiConformance } from "house-toolkit/src/conformance.mjs";
 import { fictionalMemoryPolicy, lanternAdapter, lanternKeel } from "../demo/fixtures.mjs";
 
 const protocolsRoot = resolve(dirname(fileURLToPath(import.meta.resolve("house-protocols"))), "..");
@@ -114,12 +114,12 @@ test("a durable work run links actual artifacts, evidence, initiative, memory, a
   assert.equal(runtime.getEvidence(run.run_id).claims[0].claim_type, "action_result");
   assert.equal(runtime.getEvidence(run.run_id).protocol_version, "0.2");
   assert.equal(runtime.getManifest(run.run_id).protocol_version, "0.2");
-  assert.equal(runtime.listMemories("agent:lantern").length, 1);
+  assert.equal((await runtime.listMemories("agent:lantern")).length, 1);
   assert.equal(runtime.store.listOutbox("pending").length, 1);
   assert.equal(JSON.stringify(runtime.getManifest(run.run_id)).includes(message), false);
   assert.equal(runtime.getManifest(run.run_id).entries.some((entry) => entry.locator.includes("keels/")), true);
   assert.equal(run.result.resignature_id != null, true);
-  assert.equal(runtime.listResignatures("agent:lantern")[0].claim_scope, "interpretation_only");
+  assert.equal((await runtime.listResignatures("agent:lantern"))[0].claim_scope, "interpretation_only");
   assert.equal(runtime.getAudit(run.run_id).some((event) => event.event_type === "lease_acquired"), true);
   assert.equal(statSync(options.dbPath).mode & 0o777, 0o600);
   runtime.close();
@@ -423,7 +423,7 @@ test("resignatures form an append-only interpretation chain", async () => {
   const runtime = new HouseRuntime(options).registerAgent("agent:lantern", lanternAdapter);
   await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "First reflection.", idempotencyKey: "resignature-first" });
   await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Second reflection.", idempotencyKey: "resignature-second" });
-  const records = runtime.listResignatures("agent:lantern");
+  const records = await runtime.listResignatures("agent:lantern");
   assert.deepEqual(records.map((item) => item.layer), [2, 1]);
   assert.equal(records[0].previous_resignature_id, records[1].resignature_id);
   runtime.close();
@@ -444,7 +444,7 @@ test("the explicit Memory Port is used for reads, memories, and resignatures", a
   base = new SQLiteMemoryPort(runtime.store);
   runtime.registerAgent("agent:lantern", lanternAdapter);
   await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Use port.", idempotencyKey: "memory-port-test" });
-  runtime.listResignatures("agent:lantern");
+  await runtime.listResignatures("agent:lantern");
   assert.equal(new Set(calls).size, 5);
   runtime.close();
 });
@@ -460,7 +460,7 @@ test("a schema version 1 database upgrades forward without rebuilding runs", () 
   assert.equal(columns.includes("attempts"), true);
   assert.equal(columns.includes("max_attempts"), true);
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM run_controls WHERE run_id = 'run:legacy:1'").get().count, 1);
-  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "3");
+  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "4");
   store.close();
 });
 
@@ -470,17 +470,17 @@ test("a newer database schema is rejected instead of silently downgraded", () =>
   const future = new DatabaseSync(path);
   future.exec("CREATE TABLE runtime_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO runtime_meta VALUES ('schema_version', '9');");
   future.close();
-  assert.throws(() => new RuntimeStore(path), /newer than supported schema 3/);
+  assert.throws(() => new RuntimeStore(path), /newer than supported schema 4/);
 });
 
-test("an alpha.2 schema upgrades to lifecycle schema 3", () => {
+test("an alpha.2 schema upgrades through lifecycle to memory-operation schema 4", () => {
   const root = mkdtempSync(join(tmpdir(), "house-runtime-schema-two-"));
   const path = join(root, "runtime.db");
   const old = new DatabaseSync(path);
   old.exec("CREATE TABLE runtime_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO runtime_meta VALUES ('schema_version', '2'); CREATE TABLE runs (run_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, agent_id TEXT NOT NULL, request_event_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed')), result_json TEXT, error_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3);");
   old.close();
   const store = new RuntimeStore(path);
-  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "3");
+  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "4");
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'lifecycle_opportunities'").get().count, 1);
   store.close();
 });
@@ -495,6 +495,12 @@ test("Runtime passes the shared lifecycle fixture set", () => {
   const report = runLifecycleConformance(join(protocolsRoot, "fixtures", "v0.2", "lifecycle-contracts.json"));
   assert.equal(report.ok, true);
   assert.equal(report.summary.records_checked, 5);
+});
+
+test("Runtime passes the shared transport-neutral API fixture set", () => {
+  const report = runRuntimeApiConformance(join(protocolsRoot, "fixtures", "v0.2", "runtime-api.json"));
+  assert.equal(report.ok, true);
+  assert.equal(report.summary.records_checked, 4);
 });
 
 test("stored v0.1 events remain readable after new writes move to v0.2", async () => {
@@ -657,7 +663,7 @@ test("memory is not written without an allow or quarantine decision", async () =
   const run = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "Do work.", idempotencyKey: "memory-policy-deny" });
   assert.equal(run.status, "completed");
   assert.equal(run.result.memory_id, null);
-  assert.equal(runtime.listMemories("agent:lantern").length, 0);
+  assert.equal((await runtime.listMemories("agent:lantern")).length, 0);
   runtime.close();
 });
 

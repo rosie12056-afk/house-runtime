@@ -4,9 +4,9 @@ House Runtime is an experimental, model-independent runtime for persistent singl
 
 Runtime v0.2 adds a host-polled 24-hour lifecycle on top of alpha.2 control. It locks stable Protocols and Toolkit lifecycle tags; neither dependency floats automatically.
 
-The unreleased `t4-portability` branch contains a v0.3 Memory Port candidate. Two standalone adapters use their own data files rather than RuntimeStore tables: `SQLiteMemoryAdapter` and `JsonFileMemoryAdapter`. Both expose an asynchronous API and pass the same Toolkit conformance suite. The released Runtime still uses the v0.2 embedded port until durable adapter-operation delivery is complete.
+Runtime v0.3.0-rc.1 contains a Memory Port candidate with two standalone adapters that use their own data files rather than RuntimeStore tables: `SQLiteMemoryAdapter` and `JsonFileMemoryAdapter`. Both expose an asynchronous API and pass the same Toolkit conformance suite. When an Instance supplies `memoryAdapter`, Runtime commits a durable Memory Operation before delivery, retries idempotently after restart, and exposes `pending`, `delivered`, or `failed` state. The released v0.2 line remains unchanged.
 
-The branch also contains a transport-neutral `RuntimeService`, a direct module client, and a JSON serialization client. Sensitive methods fail closed without a host authorization callback. Authentication context is attached by the host transport and is never accepted from request parameters.
+The release candidate also contains a transport-neutral `RuntimeService`, a direct module client, and a JSON serialization client. Sensitive methods fail closed without a host authorization callback. Authentication context is attached by the host transport and is never accepted from request parameters.
 
 The runtime contains no real House instance, agent personality, relationship, schedule, connector, or private data.
 

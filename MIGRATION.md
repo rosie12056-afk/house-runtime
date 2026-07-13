@@ -1,6 +1,6 @@
 # Runtime Alpha.1 to Alpha.2 Migration
 
-Alpha.2 performs a forward-only SQLite schema upgrade from version 1 to version 2. Runtime v0.2 advances it to version 3.
+Alpha.2 performs a forward-only SQLite schema upgrade from version 1 to version 2. Runtime v0.2 advances it to version 3. The unreleased v0.3 candidate advances it to version 4.
 
 ## Added state
 
@@ -14,6 +14,10 @@ Schema version 3 adds:
 - `lifecycle_opportunities` with idempotency, retry budget, and backoff state;
 - `lifecycle_records` for Journal, Dream, and Handoff documents.
 
+Schema version 4 adds `memory_operations`, a durable delivery queue for standalone asynchronous Memory Adapters. It stores operation metadata, retry state, and error codes, not authentication secrets. Existing embedded memories are not silently copied to a new adapter; adapter migration requires an explicit, backed-up migration command and verification report.
+
+`migrateEmbeddedMemory()` defaults to plan-only mode. Execution requires `execute: true`, uses deterministic operation IDs so a restart is idempotent, verifies target counts, and never deletes or rewrites source records. A target with a conflicting Resignature head fails closed rather than producing a fork.
+
 The existing `runs` table is not rebuilt. Existing Runs receive a default control record, three maximum attempts, and a 120-second adapter-generation timeout. Existing Events and other protocol records are not rewritten. Stored `0.1` records remain readable; new alpha.2 records use Protocols `0.2`.
 
 ## Before upgrade
@@ -26,4 +30,4 @@ The existing `runs` table is not rebuilt. Existing Runs receive a default contro
 
 Alpha.1 can still read its original tables because alpha.2 does not rebuild or remove them. It ignores the new tables and columns. Rollback means stopping alpha.2, restoring the coordinated backup, and restarting alpha.1. Do not run alpha.1 and alpha.2 against the same database concurrently.
 
-Databases declaring a schema newer than version 3 are rejected. The Runtime never silently downgrades a future database.
+Databases declaring a schema newer than version 4 are rejected by the v0.3 candidate. The Runtime never silently downgrades a future database.

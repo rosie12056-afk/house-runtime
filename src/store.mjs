@@ -35,7 +35,7 @@ export class RuntimeStore {
     `);
     const currentVersion = Number(this.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value);
     if (!Number.isInteger(currentVersion) || currentVersion < 1) throw new Error("invalid runtime schema version");
-    if (currentVersion > 3) throw new Error(`runtime database schema ${currentVersion} is newer than supported schema 3`);
+    if (currentVersion > 4) throw new Error(`runtime database schema ${currentVersion} is newer than supported schema 4`);
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -229,6 +229,21 @@ export class RuntimeStore {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS lifecycle_records_subject_idx ON lifecycle_records(subject_id, record_kind, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS memory_operations (
+        operation_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        operation_kind TEXT NOT NULL CHECK(operation_kind IN ('put_memory', 'append_resignature')),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'delivered', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL,
+        document_json TEXT NOT NULL,
+        last_error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS memory_operations_status_idx ON memory_operations(status, created_at);
+      CREATE INDEX IF NOT EXISTS memory_operations_run_idx ON memory_operations(run_id, status, created_at);
     `);
     this.#ensureColumn("runs", "attempts", "INTEGER NOT NULL DEFAULT 0");
     this.#ensureColumn("runs", "max_attempts", "INTEGER NOT NULL DEFAULT 3");
@@ -238,7 +253,7 @@ export class RuntimeStore {
     this.#ensureColumn("lifecycle_opportunities", "retry_delay_minutes", "INTEGER NOT NULL DEFAULT 15");
     this.db.prepare("UPDATE lifecycle_opportunities SET next_attempt_at = created_at WHERE next_attempt_at = ''").run();
     this.db.prepare("INSERT OR IGNORE INTO run_controls(run_id, timeout_ms, updated_at) SELECT run_id, 120000, updated_at FROM runs").run();
-    this.db.prepare("UPDATE runtime_meta SET value = '3' WHERE key = 'schema_version'").run();
+    this.db.prepare("UPDATE runtime_meta SET value = '4' WHERE key = 'schema_version'").run();
   }
 
   #ensureColumn(table, column, definition) {
@@ -569,6 +584,87 @@ export class RuntimeStore {
     return rows.map((row) => ({ ...row, source_refs: parse(row.source_refs_json), evidence_refs: parse(row.evidence_refs_json) }));
   }
 
+  listEmbeddedMemoriesForMigration() {
+    return this.db.prepare("SELECT * FROM memories ORDER BY subject_id, created_at, memory_id").all()
+      .map((row) => ({
+        run_id: row.run_id,
+        memory: {
+          memory_id: row.memory_id,
+          subject_id: row.subject_id,
+          kind: row.kind,
+          body: row.body,
+          source_refs: parse(row.source_refs_json),
+          evidence_refs: parse(row.evidence_refs_json),
+          status: row.status,
+          created_at: row.created_at,
+        },
+      }));
+  }
+
+  listEmbeddedResignaturesForMigration() {
+    return this.db.prepare("SELECT run_id, document_json FROM resignatures ORDER BY subject_id, layer, created_at, resignature_id").all()
+      .map((row) => ({ run_id: row.run_id, resignature: parse(row.document_json) }));
+  }
+
+  enqueueMemoryOperation(document) {
+    if (!Number.isInteger(document.max_attempts) || document.max_attempts < 1) throw new Error("memory operation max_attempts must be positive");
+    this.db.prepare("INSERT OR IGNORE INTO memory_operations(operation_id, run_id, operation_kind, status, attempts, max_attempts, document_json, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?)")
+      .run(document.operation_id, document.run_id, document.operation_kind, document.max_attempts, stringify(document), document.created_at, document.created_at);
+    return this.getMemoryOperation(document.operation_id);
+  }
+
+  getMemoryOperation(operationId) {
+    const row = this.db.prepare("SELECT * FROM memory_operations WHERE operation_id = ?").get(operationId);
+    return row ? { ...row, document: parse(row.document_json) } : null;
+  }
+
+  listMemoryOperations({ runId = null, statuses = ["pending"] } = {}) {
+    if (!Array.isArray(statuses) || statuses.length === 0 || statuses.some((status) => !new Set(["pending", "delivered", "failed"]).has(status))) throw new Error("invalid memory operation statuses");
+    const placeholders = statuses.map(() => "?").join(", ");
+    const rows = runId
+      ? this.db.prepare(`SELECT * FROM memory_operations WHERE run_id = ? AND status IN (${placeholders}) ORDER BY created_at, operation_id`).all(runId, ...statuses)
+      : this.db.prepare(`SELECT * FROM memory_operations WHERE status IN (${placeholders}) ORDER BY created_at, operation_id`).all(...statuses);
+    return rows.map((row) => ({ ...row, document: parse(row.document_json) }));
+  }
+
+  updateMemoryOperationDocument(operationId, document, at) {
+    const changed = this.db.prepare("UPDATE memory_operations SET document_json = ?, updated_at = ? WHERE operation_id = ? AND status = 'pending'")
+      .run(stringify(document), at, operationId).changes;
+    if (changed !== 1) throw new Error(`pending memory operation not found: ${operationId}`);
+    return this.getMemoryOperation(operationId);
+  }
+
+  markMemoryOperationDelivered(operationId, at) {
+    this.db.prepare("UPDATE memory_operations SET status = 'delivered', attempts = attempts + 1, last_error_code = NULL, updated_at = ? WHERE operation_id = ? AND status = 'pending'")
+      .run(at, operationId);
+    return this.getMemoryOperation(operationId);
+  }
+
+  recordMemoryOperationFailure(operationId, errorCode, at) {
+    const row = this.db.prepare("SELECT attempts, max_attempts FROM memory_operations WHERE operation_id = ? AND status = 'pending'").get(operationId);
+    if (!row) return this.getMemoryOperation(operationId);
+    const attempts = row.attempts + 1;
+    const status = attempts >= row.max_attempts ? "failed" : "pending";
+    this.db.prepare("UPDATE memory_operations SET status = ?, attempts = ?, last_error_code = ?, updated_at = ? WHERE operation_id = ?")
+      .run(status, attempts, errorCode, at, operationId);
+    return this.getMemoryOperation(operationId);
+  }
+
+  requeueFailedMemoryOperations(runId, at) {
+    const result = runId
+      ? this.db.prepare("UPDATE memory_operations SET status = 'pending', attempts = 0, last_error_code = NULL, updated_at = ? WHERE run_id = ? AND status = 'failed'").run(at, runId)
+      : this.db.prepare("UPDATE memory_operations SET status = 'pending', attempts = 0, last_error_code = NULL, updated_at = ? WHERE status = 'failed'").run(at);
+    return result.changes;
+  }
+
+  setRunMemoryDeliveryStatus(runId, status, at) {
+    const row = this.db.prepare("SELECT result_json FROM runs WHERE run_id = ? AND status = 'completed'").get(runId);
+    if (!row?.result_json) return null;
+    const result = { ...parse(row.result_json), memory_delivery_status: status };
+    this.db.prepare("UPDATE runs SET result_json = ?, updated_at = ? WHERE run_id = ?").run(stringify(result), at, runId);
+    return result;
+  }
+
   enqueueOutbox(runId, outboxId, eventId, at) {
     this.db.prepare("INSERT OR IGNORE INTO outbox(outbox_id, run_id, event_id, status, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?)")
       .run(outboxId, runId, eventId, at, at);
@@ -584,7 +680,7 @@ export class RuntimeStore {
   }
 
   count(table) {
-    const allowed = new Set(["artifacts", "audit_events", "confirmations", "context_manifests", "events", "evidence_bundles", "initiatives", "keels", "life_states", "lifecycle_opportunities", "lifecycle_records", "memories", "outbox", "proposals", "resignatures", "runs", "scheduler_leases"]);
+    const allowed = new Set(["artifacts", "audit_events", "confirmations", "context_manifests", "events", "evidence_bundles", "initiatives", "keels", "life_states", "lifecycle_opportunities", "lifecycle_records", "memories", "memory_operations", "outbox", "proposals", "resignatures", "runs", "scheduler_leases"]);
     if (!allowed.has(table)) throw new Error("unsupported count table");
     return this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count;
   }

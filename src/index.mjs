@@ -4,6 +4,7 @@ export { assertMemoryPort, SQLiteMemoryPort } from "./memory-port.mjs";
 export { assertMemoryPortCandidate, MEMORY_PORT_CANDIDATE_METHODS } from "./memory-port-candidate.mjs";
 export { JsonFileMemoryAdapter } from "./json-file-memory-adapter.mjs";
 export { SQLiteMemoryAdapter } from "./sqlite-memory-adapter.mjs";
+export { migrateEmbeddedMemory } from "./memory-migration.mjs";
 export { createJsonRuntimeExchange, DirectRuntimeClient, JsonRuntimeClient, RuntimeService } from "./runtime-service.mjs";
 export { LifeClock } from "./life-clock.mjs";
 export { RoomQueue } from "./room-queue.mjs";
