@@ -4,6 +4,16 @@ House Runtime is an experimental, model-independent runtime for persistent singl
 
 The runtime contains no real House instance, agent personality, relationship, schedule, connector, or private data.
 
+## House open-source stack
+
+The three repositories form one explicit chain:
+
+1. **[House Protocols](https://github.com/rosie12056-afk/house-protocols)** defines what records mean and which trust boundaries must hold.
+2. **[House Toolkit](https://github.com/rosie12056-afk/house-toolkit)** checks protocol, evidence, completion, and publication rules.
+3. **[House Runtime](https://github.com/rosie12056-afk/house-runtime)** performs durable execution under those contracts.
+
+This repository is the execution layer. It does not redefine protocol truth or ship private instance policy. See [ROADMAP.md](ROADMAP.md) and [COMPATIBILITY.md](COMPATIBILITY.md).
+
 ## Alpha flow
 
 1. A request Event and queued Run are committed before execution.
@@ -64,6 +74,8 @@ npm run check
 ```
 
 House Runtime requires Node.js 22.13 or newer and uses the built-in `node:sqlite` module. Node currently labels that API as active development and may print an experimental warning. Database access is isolated behind `RuntimeStore`, and the repository remains an alpha release until that dependency surface is stable.
+
+See [ROADMAP.md](ROADMAP.md), [COMPATIBILITY.md](COMPATIBILITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md).
 
 ## Not included
 

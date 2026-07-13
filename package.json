@@ -10,6 +10,8 @@
     "scripts/public-text-allowlist.txt",
     "src",
     "README.md",
+    "ROADMAP.md",
+    "COMPATIBILITY.md",
     "LICENSE",
     "NOTICE"
   ],
