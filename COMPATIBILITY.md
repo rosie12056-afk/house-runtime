@@ -26,6 +26,5 @@ The Runtime requires Node.js 22.13 or newer and is tested on Node 22 and 24.
 | `v0.1.0-alpha.1` | `0.1` | Toolkit `v0.1.1` | Tested and released |
 | `v0.1.0-alpha.2.1` | writes `0.2` and retains stored `0.1` reads | Toolkit `v0.2.0` | Tested; shared migrations, restart confirmation, lease expiry, cancellation, timeout, and retry boundaries pass |
 | `v0.2.0` | `0.2` plus additive lifecycle records | Toolkit `v0.2.1` | Released; fake-clock sleep, restart, tick, journal, dream, handoff, delivery, and feedback tests pass |
-| planned v0.2 | v0.2 plus lifecycle contracts | Toolkit v0.2 or later compatible profile | Not yet implemented |
 
 Compatibility is established by fixtures and restart tests, not by similar version labels.
