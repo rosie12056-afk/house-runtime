@@ -5,8 +5,8 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { HouseRuntime, RuntimeStore, SQLiteMemoryPort } from "../src/index.mjs";
-import { runMigrationConformance } from "house-toolkit/src/conformance.mjs";
+import { HouseRuntime, LifeClock, RuntimeStore, SQLiteMemoryPort } from "../src/index.mjs";
+import { runLifecycleConformance, runMigrationConformance } from "house-toolkit/src/conformance.mjs";
 import { fictionalMemoryPolicy, lanternAdapter, lanternKeel } from "../demo/fixtures.mjs";
 
 const protocolsRoot = resolve(dirname(fileURLToPath(import.meta.resolve("house-protocols"))), "..");
@@ -38,6 +38,19 @@ class ManualTime {
       job.callback();
     }
   }
+
+  set(value) {
+    this.now = Date.parse(value);
+  }
+}
+
+function fictionalSchedule(opportunities) {
+  return {
+    schedule_id: "schedule:lantern:fictional",
+    time_zone: "UTC",
+    sleep_window: { start: "22:00", end: "07:00" },
+    opportunities: opportunities.map((rule) => ({ max_attempts: 2, retry_delay_minutes: 5, ...rule })),
+  };
 }
 
 function highRiskGrant() {
@@ -109,6 +122,169 @@ test("a durable work run links actual artifacts, evidence, initiative, memory, a
   assert.equal(runtime.listResignatures("agent:lantern")[0].claim_scope, "interpretation_only");
   assert.equal(runtime.getAudit(run.run_id).some((event) => event.event_type === "lease_acquired"), true);
   assert.equal(statSync(options.dbPath).mode & 0o777, 0o600);
+  runtime.close();
+});
+
+test("Life Clock requires explicit schedules and handles an overnight sleep window", () => {
+  assert.throws(() => new LifeClock({}), /schedule_id/);
+  const clock = new LifeClock(fictionalSchedule([
+    { rule_id: "rule:lantern:dream", opportunity_type: "dream", at: "06:30", window_minutes: 30, miss_policy: "offer_on_resume", catch_up_minutes: 120, allowed_states: ["sleeping"] },
+    { rule_id: "rule:lantern:tick", opportunity_type: "tick", at: "09:00", window_minutes: 30, miss_policy: "skip", allowed_states: ["awake"] },
+  ]));
+  assert.equal(clock.stateAt("2032-04-05T23:00:00.000Z"), "sleeping");
+  assert.equal(clock.stateAt("2032-04-06T06:35:00.000Z"), "sleeping");
+  assert.equal(clock.stateAt("2032-04-06T09:05:00.000Z"), "awake");
+  assert.deepEqual(clock.dueWindows("2032-04-06T06:35:00.000Z").map((item) => item.rule.opportunity_type), ["dream"]);
+  assert.equal(clock.dueWindows("2032-04-06T07:30:00.000Z")[0].catchUp, true);
+});
+
+test("a dream opportunity is agent-owned, non-factual, and restart-idempotent", async () => {
+  const time = new ManualTime("2032-04-06T06:35:00.000Z");
+  const schedule = fictionalSchedule([
+    { rule_id: "rule:lantern:dream", opportunity_type: "dream", at: "06:30", window_minutes: 30, miss_policy: "offer_on_resume", catch_up_minutes: 120, allowed_states: ["sleeping"] },
+  ]);
+  const { options } = environment("dream-lifecycle", { clock: time.clock });
+  let calls = 0;
+  const lifecycleAdapter = {
+    async consider(input) {
+      calls += 1;
+      assert.equal("prompt" in input, false);
+      return {
+        decision: "accept",
+        reason_codes: ["agent_chose_to_record"],
+        outcome: {
+          type: "dream",
+          content: {
+            body: "Two fictional fragments changed order without claiming that the scene occurred.",
+            fragment_refs: [],
+            affect_words: ["unfinished"],
+          },
+        },
+      };
+    },
+  };
+  let runtime = new HouseRuntime(options).registerLifecycle("agent:lantern", { schedule, adapter: lifecycleAdapter });
+  const first = await runtime.pollLifecycle("agent:lantern");
+  assert.equal(first[0].status, "accepted");
+  assert.equal(runtime.getLifeState("agent:lantern").state, "sleeping");
+  assert.equal(runtime.listLifecycleRecords("agent:lantern", "dream")[0].factuality, "non_factual");
+  runtime.close();
+
+  runtime = new HouseRuntime(options).registerLifecycle("agent:lantern", { schedule, adapter: lifecycleAdapter });
+  assert.deepEqual(await runtime.pollLifecycle("agent:lantern"), []);
+  assert.equal(runtime.store.count("lifecycle_records"), 1);
+  assert.equal(calls, 1);
+  runtime.close();
+});
+
+test("an unsupported journal observation remains offered and is not persisted", async () => {
+  const time = new ManualTime("2032-04-05T20:05:00.000Z");
+  const schedule = fictionalSchedule([
+    { rule_id: "rule:lantern:journal", opportunity_type: "journal", at: "20:00", window_minutes: 30, miss_policy: "offer_on_resume", catch_up_minutes: 60, allowed_states: ["awake"] },
+  ]);
+  const { options } = environment("journal-boundary", { clock: time.clock });
+  const runtime = new HouseRuntime(options).registerLifecycle("agent:lantern", {
+    schedule,
+    adapter: {
+      async consider() {
+        return {
+          decision: "accept",
+          reason_codes: ["agent_chose_to_record"],
+          outcome: {
+            type: "journal",
+            content: {
+              events: [{ statement: "An unsupported event occurred.", epistemic_status: "observed", source_refs: [], evidence_refs: [] }],
+              reflections: [],
+              intentions: [],
+            },
+          },
+        };
+      },
+    },
+  });
+  const result = await runtime.pollLifecycle("agent:lantern");
+  assert.equal(result[0].status, "offered");
+  assert.deepEqual(await runtime.pollLifecycle("agent:lantern"), []);
+  time.advance(5 * 60000);
+  const exhausted = await runtime.pollLifecycle("agent:lantern");
+  assert.equal(exhausted[0].status, "declined");
+  assert.equal(runtime.store.count("lifecycle_records"), 0);
+  runtime.close();
+});
+
+test("tick work closes through artifact, Evidence, delivery, and agent-authored feedback", async () => {
+  const time = new ManualTime("2032-04-05T09:05:00.000Z");
+  const schedule = fictionalSchedule([
+    { rule_id: "rule:lantern:tick", opportunity_type: "tick", at: "09:00", window_minutes: 30, miss_policy: "skip", allowed_states: ["awake"] },
+  ]);
+  const { options } = environment("initiative-loop", { clock: time.clock, memoryPolicy: fictionalMemoryPolicy() });
+  const lifecycleAdapter = {
+    async consider({ opportunity }) {
+      if (opportunity.opportunity_type === "tick") {
+        return {
+          decision: "accept",
+          reason_codes: ["agent_selected_work"],
+          outcome: { type: "initiative", content: { room_id: "room:studio", message: "Create the fictional field note selected from this opportunity." } },
+        };
+      }
+      const evidence = opportunity.source_refs.find((reference) => reference.kind === "evidence");
+      const event = opportunity.source_refs.find((reference) => reference.kind === "event");
+      return {
+        decision: "accept",
+        reason_codes: ["agent_reflected_after_delivery"],
+        outcome: {
+          type: "journal",
+          content: {
+            events: [{ statement: "The Runtime delivered the selected work.", epistemic_status: "observed", source_refs: [event], evidence_refs: [evidence.ref_id] }],
+            reflections: [{ body: "Delivery changed the initiative from an intention into a reviewable result.", source_refs: [evidence] }],
+            intentions: [{ body: "Wait for substantive feedback before revising the result.", status: "open" }],
+          },
+        },
+      };
+    },
+  };
+  const runtime = new HouseRuntime(options)
+    .registerAgent("agent:lantern", lanternAdapter)
+    .registerLifecycle("agent:lantern", { schedule, adapter: lifecycleAdapter });
+  const tick = await runtime.pollLifecycle("agent:lantern");
+  assert.equal(tick[0].response_kind, "initiative");
+  assert.equal(runtime.store.count("initiatives"), 1);
+  assert.equal(runtime.store.count("evidence_bundles"), 1);
+  await runtime.drainOutbox(() => undefined);
+  const feedback = await runtime.pollLifecycle("agent:lantern");
+  assert.equal(feedback[0].response_kind, "journal");
+  assert.equal(runtime.listLifecycleRecords("agent:lantern", "journal").length, 1);
+  runtime.close();
+});
+
+test("sleep transitions and handoff records remain distinct from dreams", async () => {
+  const time = new ManualTime("2032-04-05T21:55:00.000Z");
+  const schedule = fictionalSchedule([
+    { rule_id: "rule:lantern:handoff", opportunity_type: "handoff", at: "21:50", window_minutes: 10, miss_policy: "offer_on_resume", catch_up_minutes: 30, allowed_states: ["awake"] },
+  ]);
+  const { options } = environment("handoff", { clock: time.clock });
+  const runtime = new HouseRuntime(options).registerLifecycle("agent:lantern", {
+    schedule,
+    adapter: {
+      async consider() {
+        return {
+          decision: "accept",
+          reason_codes: ["agent_chose_handoff"],
+          outcome: { type: "handoff", content: { open_initiative_refs: [], completed_initiative_refs: [], unresolved_questions: ["What should be revisited after waking?"], source_refs: [] } },
+        };
+      },
+    },
+  });
+  await runtime.pollLifecycle("agent:lantern");
+  const awake = runtime.getLifeState("agent:lantern");
+  time.set("2032-04-05T22:05:00.000Z");
+  await runtime.pollLifecycle("agent:lantern");
+  const sleeping = runtime.getLifeState("agent:lantern");
+  assert.equal(awake.state, "awake");
+  assert.equal(sleeping.state, "sleeping");
+  assert.equal(sleeping.previous_state_id, awake.state_id);
+  assert.equal(runtime.listLifecycleRecords("agent:lantern", "handoff").length, 1);
+  assert.equal(runtime.listLifecycleRecords("agent:lantern", "dream").length, 0);
   runtime.close();
 });
 
@@ -284,7 +460,7 @@ test("a schema version 1 database upgrades forward without rebuilding runs", () 
   assert.equal(columns.includes("attempts"), true);
   assert.equal(columns.includes("max_attempts"), true);
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM run_controls WHERE run_id = 'run:legacy:1'").get().count, 1);
-  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "2");
+  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "3");
   store.close();
 });
 
@@ -294,13 +470,31 @@ test("a newer database schema is rejected instead of silently downgraded", () =>
   const future = new DatabaseSync(path);
   future.exec("CREATE TABLE runtime_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO runtime_meta VALUES ('schema_version', '9');");
   future.close();
-  assert.throws(() => new RuntimeStore(path), /newer than supported schema 2/);
+  assert.throws(() => new RuntimeStore(path), /newer than supported schema 3/);
+});
+
+test("an alpha.2 schema upgrades to lifecycle schema 3", () => {
+  const root = mkdtempSync(join(tmpdir(), "house-runtime-schema-two-"));
+  const path = join(root, "runtime.db");
+  const old = new DatabaseSync(path);
+  old.exec("CREATE TABLE runtime_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO runtime_meta VALUES ('schema_version', '2'); CREATE TABLE runs (run_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, agent_id TEXT NOT NULL, request_event_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed')), result_json TEXT, error_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3);");
+  old.close();
+  const store = new RuntimeStore(path);
+  assert.equal(store.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value, "3");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'lifecycle_opportunities'").get().count, 1);
+  store.close();
 });
 
 test("Runtime passes the shared v0.1-to-v0.2 migration fixture set", () => {
   const report = runMigrationConformance(join(protocolsRoot, "fixtures", "migrations", "v0.1-to-v0.2.json"));
   assert.equal(report.ok, true);
   assert.equal(report.summary.records_checked, 7);
+});
+
+test("Runtime passes the shared lifecycle fixture set", () => {
+  const report = runLifecycleConformance(join(protocolsRoot, "fixtures", "v0.2", "lifecycle-contracts.json"));
+  assert.equal(report.ok, true);
+  assert.equal(report.summary.records_checked, 5);
 });
 
 test("stored v0.1 events remain readable after new writes move to v0.2", async () => {

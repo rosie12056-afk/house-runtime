@@ -1,6 +1,6 @@
 {
   "name": "house-runtime",
-  "version": "0.1.0-alpha.2.1",
+  "version": "0.2.0-rc.1",
   "description": "A model-independent runtime for persistent single-user agent systems.",
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -13,6 +13,7 @@
     "ROADMAP.md",
     "COMPATIBILITY.md",
     "MIGRATION.md",
+    "LIFECYCLE.md",
     "LICENSE",
     "NOTICE"
   ],
@@ -21,15 +22,16 @@
   },
   "scripts": {
     "demo": "node demo/run.mjs",
+    "demo:lifecycle": "node demo/lifecycle.mjs",
     "test": "node --test",
-    "scan:private": "house-privacy-scan . --exclude node_modules --exclude .git --exclude .demo-output --english-only --allow-text-file scripts/public-text-allowlist.txt",
-    "check": "npm test && npm run demo && npm run scan:private"
+    "scan:private": "house-privacy-scan . --exclude node_modules --exclude .git --exclude .demo-output --exclude .lifecycle-demo-output --english-only --allow-text-file scripts/public-text-allowlist.txt",
+    "check": "npm test && npm run demo && npm run demo:lifecycle && npm run scan:private"
   },
   "dependencies": {
-    "house-protocols": "github:rosie12056-afk/house-protocols#v0.2.0"
+    "house-protocols": "github:rosie12056-afk/house-protocols#v0.2.1-rc.1"
   },
   "devDependencies": {
-    "house-toolkit": "github:rosie12056-afk/house-toolkit#v0.2.0"
+    "house-toolkit": "github:rosie12056-afk/house-toolkit#v0.2.1-rc.1"
   },
   "engines": {
     "node": ">=22.13"

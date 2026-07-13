@@ -1,5 +1,6 @@
 node_modules/
 .demo-output/
+.lifecycle-demo-output/
 coverage/
 .DS_Store
 *.log

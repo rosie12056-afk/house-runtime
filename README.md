@@ -2,7 +2,7 @@
 
 House Runtime is an experimental, model-independent runtime for persistent single-user agent systems. It provides durable runs, per-room generation queues, protocol-validated context and evidence, immutable Keel revisions, policy-gated memory writes, local artifacts, and an outbox that survives process restarts.
 
-Alpha.2 explicitly writes House Protocols `0.2` documents while retaining read compatibility for stored `0.1` records. It locks the stable Protocols and Toolkit `v0.2.0` tags; neither dependency floats automatically.
+The v0.2 release candidate adds a host-polled 24-hour lifecycle on top of alpha.2 control. It locks Protocols and Toolkit lifecycle release candidates; neither dependency floats automatically.
 
 The runtime contains no real House instance, agent personality, relationship, schedule, connector, or private data.
 
@@ -45,11 +45,25 @@ The Runtime does not implement login or session verification itself. A host appl
 ```bash
 npm install
 npm run demo
+npm run demo:lifecycle
 ```
 
 The demo uses two fictional agents, `Lantern` and `Harbor`. Lantern writes a fictional field note. Harbor receives the artifact through a referenced context entry and writes a review. The demo then closes and reopens the SQLite database to verify that runs, artifacts, evidence, initiatives, memories, Keels, and pending delivery state remain available.
 
 Demo output is written to `.demo-output/`.
+
+The lifecycle demo uses an explicit fictional UTC schedule and fake time. It shows `tick -> Initiative -> artifact/Evidence -> delivery -> feedback journal`, then handoff, sleeping state, and a structurally non-factual dream. Its output is written to `.lifecycle-demo-output/`.
+
+## 24-hour lifecycle
+
+- An Instance must explicitly configure each subject's IANA timezone, sleep window, opportunity windows, allowed states, missed-window policy, retry budget, and retry delay. The Runtime ships no default city, schedule, interest, or topic selector.
+- The host calls `pollLifecycle()`. Polling is idempotent across restart and does not start an invisible infinite timer.
+- The lifecycle adapter receives a structured Opportunity and can accept or decline it. The Runtime supplies no personality prompt and does not require an Agent to produce work.
+- Adapter failures back off and stop at the configured attempt budget.
+- Journal events marked observed require Evidence. Reports and inferences require source references. Dreams are always `non_factual`.
+- Delivery creates a feedback Opportunity, allowing Initiative work to continue through a result and later reflection instead of stopping at “I thought about it.”
+
+See [LIFECYCLE.md](LIFECYCLE.md) for the schedule and adapter contracts.
 
 ## Adapter boundary
 
@@ -90,14 +104,14 @@ npm run check
 
 House Runtime requires Node.js 22.13 or newer and uses the built-in `node:sqlite` module. Node currently labels that API as active development and may print an experimental warning. Database access is isolated behind `RuntimeStore`, and the repository remains an alpha release until that dependency surface is stable.
 
-See [MIGRATION.md](MIGRATION.md), [ROADMAP.md](ROADMAP.md), [COMPATIBILITY.md](COMPATIBILITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md).
+See [LIFECYCLE.md](LIFECYCLE.md), [MIGRATION.md](MIGRATION.md), [ROADMAP.md](ROADMAP.md), [COMPATIBILITY.md](COMPATIBILITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md).
 
 ## Not included
 
 - Model provider clients or prompts.
 - Email, Telegram, forum, game, browser, search, or other external connectors.
 - Production authentication or a public HTTP server.
-- Life Clock, tick, dream, journal, or handoff modules; these are v0.2 milestones.
+- A built-in model provider, default lifecycle prompt, or private House schedule.
 - House Console.
 
 ## License

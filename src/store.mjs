@@ -35,7 +35,7 @@ export class RuntimeStore {
     `);
     const currentVersion = Number(this.db.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get().value);
     if (!Number.isInteger(currentVersion) || currentVersion < 1) throw new Error("invalid runtime schema version");
-    if (currentVersion > 2) throw new Error(`runtime database schema ${currentVersion} is newer than supported schema 2`);
+    if (currentVersion > 3) throw new Error(`runtime database schema ${currentVersion} is newer than supported schema 3`);
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -189,11 +189,56 @@ export class RuntimeStore {
         occurred_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS audit_events_run_idx ON audit_events(run_id, occurred_at);
+
+      CREATE TABLE IF NOT EXISTS life_states (
+        state_id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL,
+        schedule_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('awake', 'sleeping')),
+        document_json TEXT NOT NULL,
+        effective_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS life_states_subject_idx ON life_states(subject_id, effective_at DESC);
+
+      CREATE TABLE IF NOT EXISTS lifecycle_opportunities (
+        opportunity_id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL,
+        rule_id TEXT NOT NULL,
+        opportunity_type TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('offered', 'accepted', 'declined', 'expired')),
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        document_json TEXT NOT NULL,
+        response_kind TEXT,
+        response_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL,
+        next_attempt_at TEXT NOT NULL,
+        retry_delay_minutes INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(subject_id, rule_id, window_start)
+      );
+      CREATE INDEX IF NOT EXISTS lifecycle_opportunities_open_idx ON lifecycle_opportunities(subject_id, status, window_end);
+
+      CREATE TABLE IF NOT EXISTS lifecycle_records (
+        record_id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL,
+        record_kind TEXT NOT NULL CHECK(record_kind IN ('journal', 'dream', 'handoff')),
+        opportunity_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_opportunities(opportunity_id),
+        document_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS lifecycle_records_subject_idx ON lifecycle_records(subject_id, record_kind, created_at DESC);
     `);
     this.#ensureColumn("runs", "attempts", "INTEGER NOT NULL DEFAULT 0");
     this.#ensureColumn("runs", "max_attempts", "INTEGER NOT NULL DEFAULT 3");
+    this.#ensureColumn("lifecycle_opportunities", "attempts", "INTEGER NOT NULL DEFAULT 0");
+    this.#ensureColumn("lifecycle_opportunities", "max_attempts", "INTEGER NOT NULL DEFAULT 1");
+    this.#ensureColumn("lifecycle_opportunities", "next_attempt_at", "TEXT NOT NULL DEFAULT ''");
+    this.#ensureColumn("lifecycle_opportunities", "retry_delay_minutes", "INTEGER NOT NULL DEFAULT 15");
+    this.db.prepare("UPDATE lifecycle_opportunities SET next_attempt_at = created_at WHERE next_attempt_at = ''").run();
     this.db.prepare("INSERT OR IGNORE INTO run_controls(run_id, timeout_ms, updated_at) SELECT run_id, 120000, updated_at FROM runs").run();
-    this.db.prepare("UPDATE runtime_meta SET value = '2' WHERE key = 'schema_version'").run();
+    this.db.prepare("UPDATE runtime_meta SET value = '3' WHERE key = 'schema_version'").run();
   }
 
   #ensureColumn(table, column, definition) {
@@ -367,6 +412,72 @@ export class RuntimeStore {
       .map((row) => ({ ...row, detail: parse(row.detail_json) }));
   }
 
+  saveLifeState(document) {
+    this.db.prepare("INSERT INTO life_states(state_id, subject_id, schedule_id, state, document_json, effective_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(document.state_id, document.subject_id, document.schedule_id, document.state, stringify(document), document.effective_at);
+  }
+
+  getLatestLifeState(subjectId) {
+    const row = this.db.prepare("SELECT document_json FROM life_states WHERE subject_id = ? ORDER BY effective_at DESC, state_id DESC LIMIT 1").get(subjectId);
+    return row ? parse(row.document_json) : null;
+  }
+
+  saveOpportunity(ruleId, document, { maxAttempts, retryDelayMinutes }) {
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new Error("opportunity maxAttempts must be positive");
+    if (!Number.isInteger(retryDelayMinutes) || retryDelayMinutes < 1) throw new Error("opportunity retryDelayMinutes must be positive");
+    this.db.prepare("INSERT OR IGNORE INTO lifecycle_opportunities(opportunity_id, subject_id, rule_id, opportunity_type, status, window_start, window_end, document_json, attempts, max_attempts, next_attempt_at, retry_delay_minutes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)")
+      .run(document.opportunity_id, document.subject_id, ruleId, document.opportunity_type, document.status, document.window_start, document.window_end, stringify(document), maxAttempts, document.created_at, retryDelayMinutes, document.created_at);
+    const row = this.db.prepare("SELECT document_json FROM lifecycle_opportunities WHERE subject_id = ? AND rule_id = ? AND window_start = ?").get(document.subject_id, ruleId, document.window_start);
+    return parse(row.document_json);
+  }
+
+  listOpenOpportunities(subjectId, at) {
+    return this.db.prepare("SELECT document_json FROM lifecycle_opportunities WHERE subject_id = ? AND status = 'offered' AND attempts < max_attempts AND next_attempt_at <= ? AND window_start <= ? AND window_end > ? ORDER BY window_start, opportunity_id").all(subjectId, at, at, at)
+      .map((row) => parse(row.document_json));
+  }
+
+  recordOpportunityFailure(opportunityId, at) {
+    const row = this.db.prepare("SELECT attempts, max_attempts, retry_delay_minutes, document_json FROM lifecycle_opportunities WHERE opportunity_id = ? AND status = 'offered'").get(opportunityId);
+    if (!row) return null;
+    const attempts = row.attempts + 1;
+    const exhausted = attempts >= row.max_attempts;
+    const document = exhausted
+      ? { ...parse(row.document_json), status: "declined", reason_codes: [...new Set([...parse(row.document_json).reason_codes, "attempt_budget_exhausted"])] }
+      : parse(row.document_json);
+    const nextAttemptAt = new Date(Date.parse(at) + row.retry_delay_minutes * 60000).toISOString();
+    this.db.prepare("UPDATE lifecycle_opportunities SET attempts = ?, status = ?, next_attempt_at = ?, document_json = ? WHERE opportunity_id = ?")
+      .run(attempts, document.status, nextAttemptAt, stringify(document), opportunityId);
+    return document;
+  }
+
+  expireOpportunities(subjectId, at) {
+    const rows = this.db.prepare("SELECT opportunity_id, document_json FROM lifecycle_opportunities WHERE subject_id = ? AND status = 'offered' AND window_end <= ?").all(subjectId, at);
+    for (const row of rows) {
+      const document = { ...parse(row.document_json), status: "expired" };
+      this.db.prepare("UPDATE lifecycle_opportunities SET status = 'expired', document_json = ? WHERE opportunity_id = ?").run(stringify(document), row.opportunity_id);
+    }
+    return rows.length;
+  }
+
+  resolveOpportunity(opportunityId, document, responseKind = null, responseId = null) {
+    this.db.prepare("UPDATE lifecycle_opportunities SET status = ?, document_json = ?, response_kind = ?, response_id = ? WHERE opportunity_id = ? AND status = 'offered'")
+      .run(document.status, stringify(document), responseKind, responseId, opportunityId);
+    return this.db.prepare("SELECT document_json FROM lifecycle_opportunities WHERE opportunity_id = ?").get(opportunityId)
+      ? parse(this.db.prepare("SELECT document_json FROM lifecycle_opportunities WHERE opportunity_id = ?").get(opportunityId).document_json)
+      : null;
+  }
+
+  saveLifecycleRecord(kind, opportunityId, document) {
+    const idField = kind === "journal" ? "journal_id" : kind === "dream" ? "dream_id" : "handoff_id";
+    this.db.prepare("INSERT INTO lifecycle_records(record_id, subject_id, record_kind, opportunity_id, document_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(document[idField], document.subject_id, kind, opportunityId, stringify(document), document.created_at);
+  }
+
+  listLifecycleRecords(subjectId, kind, limit = 20) {
+    return this.db.prepare("SELECT document_json FROM lifecycle_records WHERE subject_id = ? AND record_kind = ? ORDER BY created_at DESC LIMIT ?").all(subjectId, kind, limit)
+      .map((row) => parse(row.document_json));
+  }
+
   saveProposal(runId, proposal, at) {
     this.db.prepare("INSERT OR IGNORE INTO proposals(run_id, proposal_json, created_at) VALUES (?, ?, ?)")
       .run(runId, stringify(proposal), at);
@@ -473,7 +584,7 @@ export class RuntimeStore {
   }
 
   count(table) {
-    const allowed = new Set(["artifacts", "audit_events", "confirmations", "context_manifests", "events", "evidence_bundles", "initiatives", "keels", "memories", "outbox", "proposals", "resignatures", "runs", "scheduler_leases"]);
+    const allowed = new Set(["artifacts", "audit_events", "confirmations", "context_manifests", "events", "evidence_bundles", "initiatives", "keels", "life_states", "lifecycle_opportunities", "lifecycle_records", "memories", "outbox", "proposals", "resignatures", "runs", "scheduler_leases"]);
     if (!allowed.has(table)) throw new Error("unsupported count table");
     return this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count;
   }

@@ -1,6 +1,7 @@
 import { assertProtocol, protocolProfiles } from "house-protocols";
 import { ExecutionCancelledError, ExecutionTimeoutError, runWithControls } from "./execution-control.mjs";
 import { createId, isoTime, runScopedId, sha256 } from "./ids.mjs";
+import { LifeClock } from "./life-clock.mjs";
 import { assertMemoryPort, SQLiteMemoryPort } from "./memory-port.mjs";
 import { RoomQueue } from "./room-queue.mjs";
 import { RuntimeStore } from "./store.mjs";
@@ -15,7 +16,7 @@ function normalizeReference(reference) {
   assertString(reference.ref_id, "context reference ref_id", 160);
   assertString(reference.kind, "context reference kind", 40);
   assertString(reference.locator, "context reference locator", 1024);
-  const allowedKinds = new Set(["event", "message", "memory", "artifact", "source", "claim", "evidence", "lifecycle", "scheduler_lease", "capability_grant", "other"]);
+  const allowedKinds = new Set(["event", "message", "memory", "artifact", "source", "claim", "evidence", "lifecycle", "scheduler_lease", "capability_grant", "life_state", "opportunity", "journal", "dream", "handoff", "other"]);
   if (!allowedKinds.has(reference.kind)) throw new Error(`unsupported context reference kind: ${reference.kind}`);
   return {
     ref_id: reference.ref_id,
@@ -47,6 +48,24 @@ function validateProposal(proposal) {
   return proposal;
 }
 
+function validateLifecycleDecision(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("lifecycle decision must be an object");
+  assertExactKeys(value, new Set(["decision", "reason_codes", "outcome"]), "lifecycle decision");
+  if (!new Set(["accept", "decline"]).has(value.decision)) throw new Error("lifecycle decision must be accept or decline");
+  if (!Array.isArray(value.reason_codes) || !value.reason_codes.length || new Set(value.reason_codes).size !== value.reason_codes.length || value.reason_codes.some((item) => typeof item !== "string" || !/^[a-z][a-z0-9_.-]{1,119}$/.test(item))) {
+    throw new Error("lifecycle decision requires reason_codes");
+  }
+  if (value.decision === "decline") {
+    if (value.outcome != null) throw new Error("declined lifecycle decisions cannot contain an outcome");
+    return value;
+  }
+  if (!value.outcome || typeof value.outcome !== "object" || Array.isArray(value.outcome)) throw new Error("accepted lifecycle decisions require an outcome");
+  assertExactKeys(value.outcome, new Set(["type", "content"]), "lifecycle outcome");
+  if (!new Set(["journal", "dream", "handoff", "initiative"]).has(value.outcome.type)) throw new Error("unsupported lifecycle outcome type");
+  if (!value.outcome.content || typeof value.outcome.content !== "object" || Array.isArray(value.outcome.content)) throw new Error("lifecycle outcome content must be an object");
+  return value;
+}
+
 function assertExactKeys(value, allowed, name) {
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(`${name} contains unsupported field: ${key}`);
@@ -64,6 +83,7 @@ export class HouseRuntime {
   #scheduled = new Map();
   #controllers = new Map();
   #leases = new Map();
+  #lifecycles = new Map();
 
   constructor({ dbPath, workspaceDir, instanceId = "instance:fictional-demo", userId = "user:avery", runtimeId = createId("runtime"), protocolVersion = "0.2", clock = () => new Date(), timer, leaseMs = 30000, defaultTimeoutMs = 120000, defaultMaxAttempts = 3, confirmationVerifier = null, memoryPolicy = null, memoryPort = null }) {
     assertString(instanceId, "instanceId", 160);
@@ -95,6 +115,119 @@ export class HouseRuntime {
     if (!adapter || typeof adapter.generate !== "function") throw new Error("agent adapter must implement generate(input)");
     this.#agents.set(agentId, adapter);
     return this;
+  }
+
+  registerLifecycle(subjectId, { schedule, adapter }) {
+    assertString(subjectId, "lifecycle subjectId", 160);
+    if (!adapter || typeof adapter.consider !== "function") throw new Error("lifecycle adapter must implement consider(input)");
+    this.#lifecycles.set(subjectId, { clock: new LifeClock(schedule), adapter });
+    return this;
+  }
+
+  async pollLifecycle(subjectId = null) {
+    const registrations = subjectId
+      ? [[subjectId, this.#lifecycles.get(subjectId)]]
+      : [...this.#lifecycles.entries()];
+    if (subjectId && !registrations[0][1]) throw new Error(`no lifecycle registered for ${subjectId}`);
+    const results = [];
+    for (const [currentSubject, registration] of registrations) {
+      const at = isoTime(this.clock);
+      const now = new Date(at);
+      this.store.expireOpportunities(currentSubject, at);
+      const state = registration.clock.stateAt(now);
+      let lifeState = this.store.getLatestLifeState(currentSubject);
+      if (!lifeState || lifeState.state !== state || lifeState.schedule_id !== registration.clock.scheduleId) {
+        lifeState = {
+          protocol_version: "0.2",
+          state_id: createId("life-state"),
+          subject_id: currentSubject,
+          state,
+          effective_at: at,
+          schedule_id: registration.clock.scheduleId,
+          ...(lifeState ? { previous_state_id: lifeState.state_id } : {}),
+        };
+        assertProtocol("life_state", lifeState, { profile: "0.2" });
+        this.store.saveLifeState(lifeState);
+      }
+
+      for (const window of registration.clock.dueWindows(now)) {
+        const opportunityId = `opportunity:${sha256(`${currentSubject}|${window.rule.rule_id}|${window.start.toISOString()}`).slice("sha256:".length)}`;
+        const opportunity = {
+          protocol_version: "0.2",
+          opportunity_id: opportunityId,
+          subject_id: currentSubject,
+          opportunity_type: window.rule.opportunity_type,
+          status: "offered",
+          window_start: window.start.toISOString(),
+          window_end: window.end.toISOString(),
+          created_at: at,
+          reason_codes: [window.catchUp ? "catch_up_after_downtime" : "configured_window"],
+          source_refs: [{ ref_id: lifeState.state_id, kind: "life_state", locator: `life-states/${lifeState.state_id}`, observed_at: lifeState.effective_at }],
+        };
+        assertProtocol("lifecycle_opportunity", opportunity, { profile: "0.2" });
+        const saved = this.store.saveOpportunity(window.rule.rule_id, opportunity, { maxAttempts: window.rule.max_attempts, retryDelayMinutes: window.rule.retry_delay_minutes });
+        if (!window.rule.allowed_states.includes(state) && saved.status === "offered") {
+          const declined = { ...saved, status: "declined", reason_codes: [...new Set([...saved.reason_codes, "state_not_allowed"])] };
+          assertProtocol("lifecycle_opportunity", declined, { profile: "0.2" });
+          this.store.resolveOpportunity(saved.opportunity_id, declined);
+        }
+      }
+
+      const open = this.store.listOpenOpportunities(currentSubject, at);
+      for (const opportunity of open) {
+        const controller = new AbortController();
+        let decision;
+        try {
+          decision = validateLifecycleDecision(await runWithControls(() => registration.adapter.consider({
+            opportunity: structuredClone(opportunity),
+            life_state: structuredClone(lifeState),
+            context: {
+              memories: structuredClone(this.memoryPort.list(currentSubject, 20)),
+              journals: structuredClone(this.store.listLifecycleRecords(currentSubject, "journal", 5)),
+              dreams: structuredClone(this.store.listLifecycleRecords(currentSubject, "dream", 5)),
+              handoffs: structuredClone(this.store.listLifecycleRecords(currentSubject, "handoff", 5)),
+            },
+            signal: controller.signal,
+          }), { signal: controller.signal, timeoutMs: this.defaultTimeoutMs, timer: this.timer }));
+        } catch (error) {
+          this.#audit(null, "lifecycle_consider_failed", { opportunity_id: opportunity.opportunity_id, subject_id: currentSubject, error_name: error.name }, at);
+          const failed = this.store.recordOpportunityFailure(opportunity.opportunity_id, at);
+          results.push({ opportunity_id: opportunity.opportunity_id, status: failed?.status || "offered", error: error.name });
+          continue;
+        }
+
+        if (decision.decision === "decline") {
+          const declined = { ...opportunity, status: "declined", reason_codes: [...new Set([...opportunity.reason_codes, ...decision.reason_codes])] };
+          assertProtocol("lifecycle_opportunity", declined, { profile: "0.2" });
+          this.store.resolveOpportunity(opportunity.opportunity_id, declined);
+          results.push({ opportunity_id: opportunity.opportunity_id, status: "declined" });
+          continue;
+        }
+
+        let materialized;
+        try {
+          materialized = await this.#materializeLifecycle(opportunity, decision.outcome, at);
+        } catch (error) {
+          this.#audit(null, "lifecycle_materialize_failed", { opportunity_id: opportunity.opportunity_id, subject_id: currentSubject, error_name: error.name }, at);
+          const failed = this.store.recordOpportunityFailure(opportunity.opportunity_id, at);
+          results.push({ opportunity_id: opportunity.opportunity_id, status: failed?.status || "offered", error: error.name });
+          continue;
+        }
+        const accepted = {
+          ...opportunity,
+          status: "accepted",
+          reason_codes: [...new Set([...opportunity.reason_codes, ...decision.reason_codes])],
+          response_ref: materialized.reference,
+        };
+        assertProtocol("lifecycle_opportunity", accepted, { profile: "0.2" });
+        this.store.transaction(() => {
+          if (materialized.record) this.store.saveLifecycleRecord(materialized.kind, opportunity.opportunity_id, materialized.record);
+          this.store.resolveOpportunity(opportunity.opportunity_id, accepted, materialized.kind, materialized.id);
+        });
+        results.push({ opportunity_id: opportunity.opportunity_id, status: "accepted", response_kind: materialized.kind, response_id: materialized.id });
+      }
+    }
+    return results;
   }
 
   putKeel(keel) {
@@ -236,6 +369,115 @@ export class HouseRuntime {
     return Promise.all(this.store.listPendingRuns().map((run) => this.executeRun(run.run_id)));
   }
 
+  async #materializeLifecycle(opportunity, outcome, at) {
+    const allowed = {
+      tick: new Set(["journal", "initiative"]),
+      journal: new Set(["journal"]),
+      dream: new Set(["dream"]),
+      handoff: new Set(["handoff"]),
+      feedback: new Set(["journal"]),
+    };
+    if (!allowed[opportunity.opportunity_type]?.has(outcome.type)) {
+      throw new Error(`${opportunity.opportunity_type} opportunities cannot produce ${outcome.type}`);
+    }
+    const content = outcome.content;
+    const suffix = opportunity.opportunity_id.slice("opportunity:".length);
+
+    if (outcome.type === "initiative") {
+      assertExactKeys(content, new Set(["room_id", "message"]), "lifecycle initiative content");
+      assertString(content.room_id, "lifecycle initiative room_id", 160);
+      assertString(content.message, "lifecycle initiative message", 32000);
+      if (!this.#agents.has(opportunity.subject_id)) throw new Error(`no adapter registered for ${opportunity.subject_id}`);
+      const run = await this.submit({
+        roomId: content.room_id,
+        agentId: opportunity.subject_id,
+        message: content.message,
+        idempotencyKey: `lifecycle:${suffix}`,
+      });
+      return {
+        kind: "initiative",
+        id: run.run_id,
+        reference: { ref_id: run.run_id, kind: "other", locator: `runs/${run.run_id}`, observed_at: run.created_at },
+      };
+    }
+
+    if (outcome.type === "journal") {
+      assertExactKeys(content, new Set(["events", "reflections", "intentions"]), "lifecycle journal content");
+      if (!Array.isArray(content.events) || !Array.isArray(content.reflections) || !Array.isArray(content.intentions)) throw new Error("journal content requires event, reflection, and intention arrays");
+      const document = {
+        protocol_version: "0.2",
+        journal_id: `journal:${suffix}`,
+        subject_id: opportunity.subject_id,
+        period_start: opportunity.window_start,
+        period_end: at,
+        events: content.events.map((item, index) => {
+          assertExactKeys(item, new Set(["statement", "epistemic_status", "source_refs", "evidence_refs"]), "journal event");
+          return { ...structuredClone(item), entry_id: `journal-event:${suffix}:${index + 1}` };
+        }),
+        reflections: content.reflections.map((item, index) => {
+          assertExactKeys(item, new Set(["body", "source_refs"]), "journal reflection");
+          return { ...structuredClone(item), reflection_id: `journal-reflection:${suffix}:${index + 1}` };
+        }),
+        intentions: content.intentions.map((item, index) => {
+          assertExactKeys(item, new Set(["body", "status"]), "journal intention");
+          return { ...structuredClone(item), intention_id: `intention:${suffix}:${index + 1}` };
+        }),
+        created_at: at,
+      };
+      assertProtocol("journal_entry", document, { profile: "0.2" });
+      return {
+        kind: "journal",
+        id: document.journal_id,
+        record: document,
+        reference: { ref_id: document.journal_id, kind: "journal", locator: `lifecycle/journals/${document.journal_id}`, observed_at: at },
+      };
+    }
+
+    if (outcome.type === "dream") {
+      assertExactKeys(content, new Set(["body", "fragment_refs", "affect_words"]), "lifecycle dream content");
+      const document = {
+        protocol_version: "0.2",
+        dream_id: `dream:${suffix}`,
+        subject_id: opportunity.subject_id,
+        period_start: opportunity.window_start,
+        period_end: at,
+        factuality: "non_factual",
+        body: content.body,
+        fragment_refs: structuredClone(content.fragment_refs || []),
+        ...(content.affect_words ? { affect_words: structuredClone(content.affect_words) } : {}),
+        created_at: at,
+      };
+      assertProtocol("dream_record", document, { profile: "0.2" });
+      return {
+        kind: "dream",
+        id: document.dream_id,
+        record: document,
+        reference: { ref_id: document.dream_id, kind: "dream", locator: `lifecycle/dreams/${document.dream_id}`, observed_at: at },
+      };
+    }
+
+    assertExactKeys(content, new Set(["open_initiative_refs", "completed_initiative_refs", "unresolved_questions", "source_refs"]), "lifecycle handoff content");
+    const document = {
+      protocol_version: "0.2",
+      handoff_id: `handoff:${suffix}`,
+      subject_id: opportunity.subject_id,
+      period_start: opportunity.window_start,
+      period_end: at,
+      open_initiative_refs: structuredClone(content.open_initiative_refs || []),
+      completed_initiative_refs: structuredClone(content.completed_initiative_refs || []),
+      unresolved_questions: structuredClone(content.unresolved_questions || []),
+      source_refs: structuredClone(content.source_refs || []),
+      created_at: at,
+    };
+    assertProtocol("handoff_record", document, { profile: "0.2" });
+    return {
+      kind: "handoff",
+      id: document.handoff_id,
+      record: document,
+      reference: { ref_id: document.handoff_id, kind: "handoff", locator: `lifecycle/handoffs/${document.handoff_id}`, observed_at: at },
+    };
+  }
+
   async #executeNow(runId) {
     let run = this.store.getRun(runId);
     if (["completed", "failed", "cancelled", "timed_out", "waiting_confirmation"].includes(run.status)) return publicRun(run);
@@ -332,6 +574,29 @@ export class HouseRuntime {
       detail,
       occurred_at: at,
     });
+  }
+
+  #offerFeedback(runId, deliveredEvent, at) {
+    const run = this.store.getRun(runId);
+    if (!run || !this.#lifecycles.has(run.agent_id)) return null;
+    const opportunity = {
+      protocol_version: "0.2",
+      opportunity_id: `opportunity:${sha256(`feedback|${runId}`).slice("sha256:".length)}`,
+      subject_id: run.agent_id,
+      opportunity_type: "feedback",
+      status: "offered",
+      window_start: at,
+      window_end: new Date(Date.parse(at) + 86400000).toISOString(),
+      created_at: at,
+      reason_codes: ["delivery_confirmed"],
+      source_refs: [
+        { ref_id: deliveredEvent.event_id, kind: "event", locator: `events/${deliveredEvent.event_id}`, observed_at: deliveredEvent.occurred_at },
+        ...(run.result?.initiative_id ? [{ ref_id: run.result.initiative_id, kind: "other", locator: `initiatives/${run.result.initiative_id}` }] : []),
+        ...(run.result?.evidence_bundle_id ? [{ ref_id: run.result.evidence_bundle_id, kind: "evidence", locator: `evidence/${run.result.evidence_bundle_id}` }] : []),
+      ],
+    };
+    assertProtocol("lifecycle_opportunity", opportunity, { profile: "0.2" });
+    return this.store.saveOpportunity(`feedback:${runId}`, opportunity, { maxAttempts: 1, retryDelayMinutes: 15 });
   }
 
   #buildContext(run, event, at) {
@@ -572,7 +837,9 @@ export class HouseRuntime {
       const event = this.store.getEvent(item.event_id);
       try {
         await deliver(structuredClone(event));
-        this.store.markOutbox(item.outbox_id, "delivered", isoTime(this.clock));
+        const deliveredAt = isoTime(this.clock);
+        this.store.markOutbox(item.outbox_id, "delivered", deliveredAt);
+        this.#offerFeedback(item.run_id, event, deliveredAt);
         results.push({ outbox_id: item.outbox_id, status: "delivered" });
       } catch (error) {
         this.store.markOutbox(item.outbox_id, "failed", isoTime(this.clock), error.message);
@@ -614,6 +881,15 @@ export class HouseRuntime {
 
   listResignatures(subjectId, limit = 20) {
     return this.memoryPort.listResignatures(subjectId, limit);
+  }
+
+  getLifeState(subjectId) {
+    return this.store.getLatestLifeState(subjectId);
+  }
+
+  listLifecycleRecords(subjectId, kind, limit = 20) {
+    if (!new Set(["journal", "dream", "handoff"]).has(kind)) throw new Error("unsupported lifecycle record kind");
+    return this.store.listLifecycleRecords(subjectId, kind, limit);
   }
 
   getAudit(runId) {
