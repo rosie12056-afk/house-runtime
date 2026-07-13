@@ -982,6 +982,10 @@ export class HouseRuntime {
     return publicRun(this.store.getRun(runId));
   }
 
+  listRuns(options = {}) {
+    return this.store.listRuns(options).map((run) => publicRun(run));
+  }
+
   getManifest(runId) {
     return this.store.getManifest(runId);
   }

@@ -1,7 +1,7 @@
 import { createId } from "./ids.mjs";
 import { assertProtocol, validateProtocol } from "house-protocols";
 
-const METHODS = Object.freeze(new Set(["runtime.health", "run.submit", "run.get", "memory.query", "lifecycle.query"]));
+const METHODS = Object.freeze(new Set(["runtime.health", "run.submit", "run.list", "run.get", "evidence.get", "initiative.get", "memory.query", "lifecycle.query"]));
 const RESERVED_AUTH_KEYS = Object.freeze(new Set(["auth", "authentication", "authenticated_by", "cookie", "principal", "session", "token"]));
 
 function errorResponse(requestId, code, message) {
@@ -22,7 +22,7 @@ function assertOnlyKeys(value, keys, label) {
 }
 
 export class RuntimeService {
-  constructor(runtime, { authorize = null, runtimeVersion = "0.3.0-rc.1" } = {}) {
+  constructor(runtime, { authorize = null, runtimeVersion = "0.3.0-rc.2" } = {}) {
     if (!runtime || typeof runtime.submit !== "function") throw new Error("runtime is required");
     this.runtime = runtime;
     this.authorize = authorize;
@@ -70,10 +70,24 @@ export class RuntimeService {
       assertOnlyKeys(params, new Set(["roomId", "agentId", "message", "idempotencyKey", "contextRefs", "capabilityGrant", "timeoutMs", "maxAttempts"]), "run.submit params");
       return this.runtime.submit(params);
     }
+    if (method === "run.list") {
+      assertOnlyKeys(params, new Set(["status", "limit"]), "run.list params");
+      return this.runtime.listRuns({ status: params.status ?? null, limit: params.limit ?? 50 });
+    }
     if (method === "run.get") {
       assertOnlyKeys(params, new Set(["runId"]), "run.get params");
       if (typeof params.runId !== "string" || params.runId.length === 0) throw Object.assign(new Error("runId is required"), { code: "E_INVALID_PARAMS" });
       return this.runtime.getRun(params.runId);
+    }
+    if (method === "evidence.get") {
+      assertOnlyKeys(params, new Set(["runId"]), "evidence.get params");
+      if (typeof params.runId !== "string" || params.runId.length === 0) throw Object.assign(new Error("runId is required"), { code: "E_INVALID_PARAMS" });
+      return this.runtime.getEvidence(params.runId);
+    }
+    if (method === "initiative.get") {
+      assertOnlyKeys(params, new Set(["runId"]), "initiative.get params");
+      if (typeof params.runId !== "string" || params.runId.length === 0) throw Object.assign(new Error("runId is required"), { code: "E_INVALID_PARAMS" });
+      return this.runtime.getInitiative(params.runId);
     }
     if (method === "memory.query") {
       assertOnlyKeys(params, new Set(["subjectId", "limit", "includeQuarantined"]), "memory.query params");
@@ -94,7 +108,10 @@ function clientError(error) {
 class RuntimeClientBase {
   async health() { return this.request("runtime.health", {}); }
   async submit(params) { return this.request("run.submit", params); }
+  async listRuns(params = {}) { return this.request("run.list", params); }
   async getRun(runId) { return this.request("run.get", { runId }); }
+  async getEvidence(runId) { return this.request("evidence.get", { runId }); }
+  async getInitiative(runId) { return this.request("initiative.get", { runId }); }
   async queryMemories(params) { return this.request("memory.query", params); }
   async queryLifecycle(params) { return this.request("lifecycle.query", params); }
 

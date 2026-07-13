@@ -301,11 +301,14 @@ test("high-risk work waits for host-authenticated confirmation and survives a re
   const runtime = new HouseRuntime(options).registerAgent("agent:lantern", { async generate() { calls += 1; return { response_text: "Confirmed." }; } });
   const waiting = await runtime.submit({ roomId: "room:test", agentId: "agent:lantern", message: "External action.", idempotencyKey: "confirmation-required", capabilityGrant: highRiskGrant() });
   assert.equal(waiting.status, "waiting_confirmation");
+  assert.deepEqual(runtime.listRuns({ status: "waiting_confirmation" }).map((run) => run.run_id), [waiting.run_id]);
   assert.equal(calls, 0);
   await assert.rejects(runtime.resolveConfirmation({ confirmationId: waiting.confirmation_id, decision: "approve", authentication: { session: "forged" } }), /authentication failed/);
   assert.equal(runtime.getRun(waiting.run_id).status, "waiting_confirmation");
   const completed = await runtime.resolveConfirmation({ confirmationId: waiting.confirmation_id, decision: "approve", authentication: { session: "verified" } });
   assert.equal(completed.status, "completed");
+  assert.equal(runtime.listRuns({ status: "waiting_confirmation" }).length, 0);
+  assert.equal(runtime.listRuns({ status: "completed", limit: 1 })[0].run_id, waiting.run_id);
   assert.equal(calls, 1);
   runtime.close();
 });
@@ -500,7 +503,7 @@ test("Runtime passes the shared lifecycle fixture set", () => {
 test("Runtime passes the shared transport-neutral API fixture set", () => {
   const report = runRuntimeApiConformance(join(protocolsRoot, "fixtures", "v0.2", "runtime-api.json"));
   assert.equal(report.ok, true);
-  assert.equal(report.summary.records_checked, 4);
+  assert.equal(report.summary.records_checked, 7);
 });
 
 test("stored v0.1 events remain readable after new writes move to v0.2", async () => {

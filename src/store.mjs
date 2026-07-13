@@ -304,6 +304,17 @@ export class RuntimeStore {
     return this.#mapRun(this.db.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId));
   }
 
+  listRuns({ status = null, limit = 50 } = {}) {
+    const statuses = new Set(["queued", "running", "waiting_confirmation", "completed", "failed", "cancelled", "timed_out"]);
+    if (status != null && !statuses.has(status)) throw Object.assign(new Error("unsupported Run status"), { code: "E_INVALID_PARAMS" });
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw Object.assign(new Error("limit must be an integer between 1 and 500"), { code: "E_INVALID_PARAMS" });
+    const publicStatus = "COALESCE(c.terminal_status, CASE WHEN c.confirmation_id IS NOT NULL THEN 'waiting_confirmation' ELSE r.status END)";
+    const rows = status == null
+      ? this.db.prepare("SELECT r.* FROM runs r JOIN run_controls c ON c.run_id = r.run_id ORDER BY r.created_at DESC, r.run_id DESC LIMIT ?").all(limit)
+      : this.db.prepare(`SELECT r.* FROM runs r JOIN run_controls c ON c.run_id = r.run_id WHERE ${publicStatus} = ? ORDER BY r.created_at DESC, r.run_id DESC LIMIT ?`).all(status, limit);
+    return rows.map((row) => this.#mapRun(row));
+  }
+
   #mapRun(row) {
     if (!row) return null;
     const control = this.db.prepare("SELECT terminal_status, confirmation_id, timeout_ms FROM run_controls WHERE run_id = ?").get(row.run_id);
