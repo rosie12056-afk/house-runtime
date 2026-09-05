@@ -1,6 +1,6 @@
 {
   "name": "house-runtime",
-  "version": "0.3.0-rc.2",
+  "version": "0.3.0-rc.3",
   "description": "A model-independent runtime for persistent single-user agent systems.",
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -15,7 +15,8 @@
     "MIGRATION.md",
     "LIFECYCLE.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "CHANGELOG.md"
   ],
   "exports": {
     ".": "./src/index.mjs"
@@ -28,10 +29,10 @@
     "check": "npm test && npm run demo && npm run demo:lifecycle && npm run scan:private"
   },
   "dependencies": {
-    "house-protocols": "github:rosie12056-afk/house-protocols#v0.3.0-rc.2"
+    "house-protocols": "github:rosie12056-afk/house-protocols#v0.3.0-rc.3"
   },
   "devDependencies": {
-    "house-toolkit": "github:rosie12056-afk/house-toolkit#v0.3.0-rc.3"
+    "house-toolkit": "github:rosie12056-afk/house-toolkit#v0.3.0-rc.4"
   },
   "engines": {
     "node": ">=22.13"

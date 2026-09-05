@@ -22,7 +22,7 @@ function assertOnlyKeys(value, keys, label) {
 }
 
 export class RuntimeService {
-  constructor(runtime, { authorize = null, runtimeVersion = "0.3.0-rc.2" } = {}) {
+  constructor(runtime, { authorize = null, runtimeVersion = "0.3.0-rc.3" } = {}) {
     if (!runtime || typeof runtime.submit !== "function") throw new Error("runtime is required");
     this.runtime = runtime;
     this.authorize = authorize;
