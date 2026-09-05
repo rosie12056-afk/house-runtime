@@ -1,5 +1,7 @@
 # House Runtime
 
+Maintenance release `0.2.1` preserves the existing maturity and document profiles. See [CHANGELOG.md](CHANGELOG.md) for dependency changes and consumer lockfile guidance.
+
 House Runtime is an experimental, model-independent runtime for persistent single-user agent systems. It provides durable runs, per-room generation queues, protocol-validated context and evidence, immutable Keel revisions, policy-gated memory writes, local artifacts, and an outbox that survives process restarts.
 
 Runtime v0.2 adds a host-polled 24-hour lifecycle on top of alpha.2 control. It locks stable Protocols and Toolkit lifecycle tags; neither dependency floats automatically.

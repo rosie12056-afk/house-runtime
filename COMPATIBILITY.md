@@ -1,6 +1,6 @@
 # Compatibility
 
-## Current release
+## Released lifecycle baseline
 
 The released alpha line remains pinned to stable v0.2. Runtime `v0.2.0` explicitly adopts stable lifecycle contracts and committed lockfile SHAs:
 
@@ -19,13 +19,16 @@ The Runtime requires Node.js 22.13 or newer and is tested on Node 22 and 24.
 - A newer Toolkit may audit an older Runtime, but changing a release gate requires a Runtime commit and CI result. The Toolkit is not silently downloaded or executed by a running Runtime.
 - Database schema migrations must be forward-only, versioned, restart-tested, and documented before a Runtime release changes its storage schema.
 
-## Planned matrix
+## Compatibility history
 
 | Runtime | Protocol document profile | Toolkit profile | Status |
 | --- | --- | --- | --- |
 | `v0.1.0-alpha.1` | `0.1` | Toolkit `v0.1.1` | Tested and released |
 | `v0.1.0-alpha.2.1` | writes `0.2` and retains stored `0.1` reads | Toolkit `v0.2.0` | Tested; shared migrations, restart confirmation, lease expiry, cancellation, timeout, and retry boundaries pass |
 | `v0.2.0` | `0.2` plus additive lifecycle records | Toolkit `v0.2.1` | Released; fake-clock sleep, restart, tick, journal, dream, handoff, delivery, and feedback tests pass |
-| planned v0.2 | v0.2 plus lifecycle contracts | Toolkit v0.2 or later compatible profile | Not yet implemented |
 
 Compatibility is established by fixtures and restart tests, not by similar version labels.
+
+## September 2026 maintenance
+
+Package `0.2.1` follows `0.2.0` with unchanged document profiles and storage semantics. Its exact dependency tags are `house-protocols#v0.2.2`, `house-toolkit#v0.2.2`. Use the committed root lockfile; downstream projects must update their own locks. See [CHANGELOG.md](CHANGELOG.md).
